@@ -1,0 +1,35 @@
+# ---- 大文件（APK / dex / 反编译产物），不入库 ----
+*.apk
+*.apk.idsig
+*.dex
+*.jar
+*.so
+*.idsig
+
+# ---- 工作区 ----
+.work/
+!scripts/
+tmp/
+*.log
+logs/
+
+# ---- JADX 全量反编译源码（196MB，可用脚本重现） ----
+jadx-src/
+dexstrings.txt
+
+# ---- 密钥（不要公开提交） ----
+*.jks
+*.keystore
+keystore/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+
+# ---- 第三方 skill（由 skills-lock.json 记录来源，可重现） ----
+.pi/skills/
