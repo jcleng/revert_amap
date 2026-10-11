@@ -10,7 +10,7 @@
 - 版本：`V3.15.872.11.910.1.202608311746.2`（versionCode 872，minSdk 24，targetSdk 30）
 - 原包 SHA-256：`450a1848ec6ecbda9a981598b9338f58784dcd6951a81d7ec8a8e198f10bf285`
 
-## 2. 根因（两个，互相独立）
+## 2. 根因（三个，互相独立）
 
 原包是**第三方重打包**版本，注入了 `com.byd.automap.activity.MainActivity.mcFixDisplay()`。
 该方法在 `getDisplay().getDisplayId() != 0`（车机分屏 / 副屏的**正常**状态）时会：
@@ -28,13 +28,28 @@
 该布局正是 `NaviViewManager` 在 `PlatformUtils.isPlatformUI() == false`（多窗口 / 非平台化 UI）时选用的。
 于是 `j5 == null` → `NullPointerException`（`NaviView.Dd()+168`）→ 进导航页闪退。→ **根因 #2**
 
+第三个：界面**默认全屏**（状态栏 + 导航栏都被隐藏），同样来自注入。
+全代码树里 `setSystemUiVisibility(...)` 只有两处，其中注入的那处在
+`com.wzw.scale.DpiScaleManager.applyImmersive()`（`classes25.dex`）：
+`window.getDecorView().setSystemUiVisibility(5894)`，
+`5894 = 0x1706 = HIDE_NAVIGATION|FULLSCREEN|LAYOUT_STABLE|LAYOUT_HIDE_NAVIGATION|LAYOUT_FULLSCREEN|IMMERSIVE_STICKY`
+——沉浸式粘性全屏，**状态栏与导航栏一起隐藏**。
+它在 `MainActivity.onCreate()`（紧跟 `mcFixDisplay()`）被无条件调用，且没有任何用户开关。→ **根因 #3**
+
+> 排查时注意：`MainActivity` 的主题叫 `Theme.AppCompat.Byd.Light.NoActionBar.FullScreen.UI.Integrate`，
+> 名字里带 `FullScreen` 但**不是原因**——展开整条主题父链后没有任何 `windowFullscreen` 属性，
+> 且 `resources.arsc` 的 zip 时间戳仍是 `2026-09-30`（未被重打包改动），说明资源与主题是原版 BYD 的。
+> 另一处 `setSystemUiVisibility(5380)`（`k/e/w/r.java`，值 `0x1504`，不含 `HIDE_NAVIGATION`）
+> 也是**原版**代码：定义在未被改动的 `classes8.dex`，且有 BYD 设置 `getConfigKeySystemBarOffOn()==0` 保护。
+
 | | 触发条件 | 典型场景 |
 |---|---|---|
 | #1 `mcFixDisplay` | `getDisplay().getDisplayId() != 0` | 车机分屏 = 独立显示屏 |
 | #2 `NaviView.Dd` NPE | `isInMultiWindowMode() == true` | 同屏分屏（displayId 仍为 0） |
+| #3 `applyImmersive` | 无（每次 `onCreate` 都执行） | 界面默认全屏、状态栏/导航栏被隐藏 |
 
-> 车机分屏**同时**满足两者，所以两个都必须修。手机上用 AOSP 同屏分屏可以单独复现 #2
-> （`displayId` 不变，因此 #1 不触发）。
+> 车机分屏**同时**满足 #1 与 #2，所以两个都必须修。手机上用 AOSP 同屏分屏可以单独复现 #2
+> （`displayId` 不变，因此 #1 不触发）。#3 与分屏无关，任何设备上都生效。
 
 ## 3. 修复
 
@@ -63,9 +78,29 @@
     :cond_j5
 ```
 
-其余 14792 个 zip 条目逐字节不变，然后重新签名。
+### 修复 #3：`applyImmersive()` 不再碰 window
 
-- 补丁包：`.work/out/amap-splitfix.apk`（两个修复都在）
+只改 `classes25.dex`（`scripts/fix_DpiScaleManager.py`）：在 window 操作前插入 `goto`，
+直接跳到其后的 `VoiceXtt` 初始化（**保留语音功能**）：
+
+```smali
+    :cond_1
+    goto :goto_mc_no_immersive        # ← 新增
+
+    :try_start_1
+    ...getAttributes / layoutInDisplayCutoutMode / setSystemUiVisibility(0x1706)...（保留为死代码）
+
+    :goto_mc_no_immersive             # ← 新增
+    invoke-static {p0}, Lcom/wzw/voice/VoiceXtt;->attachContext(Landroid/content/Context;)V
+```
+
+不改 `0x1706` 为 `0x0`，是因为 `0x0` 仍会覆盖宿主可能自己设置的 UI 标志；整段不碰最安全。
+
+只替换 `classes9.dex`、`classes22.dex`、`classes25.dex`，其余 14791 个 zip 条目逐字节不变，然后重新签名。
+
+- 补丁包：`.work/out/amap-splitfix.apk`（三个修复都在）
+  SHA-256 `93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed`
+- 对照组（只修 #1+#2，用于证明 #3）：`.work/out/amap-nofix3.apk`
   SHA-256 `e32177eec5076656497a02e967f8ad0e2ef58ee03cf8ebe2cedc25da93e9ee1d`
 - 对照组（只修 #1，用于证明 #2）：`.work/out/amap-mcfix-only-signed.apk`
   SHA-256 `01de14f7620df5f47bc17620a8993a1d5e701d1a136594b8031b44dc74813cf6`
@@ -81,9 +116,10 @@
 │   ├── findings.md               # 完整逆向结论 + 运行时 A/B 验证（主文档）
 │   └── static-findings.md        # 静态分析速记
 ├── scripts/
-│   ├── build_patch.sh            # 两个 dex → 打补丁 → *_patched.dex
+│   ├── build_patch.sh            # 三个 dex → 打补丁 → *_patched.dex
 │   ├── fix_mcFixDisplay.py       # 修复 #1 的 smali 改写
 │   ├── fix_NaviView.py           # 修复 #2 的 smali 改写
+│   ├── fix_DpiScaleManager.py    # 修复 #3（强制全屏）的 smali 改写
 │   ├── build_apk.sh              # 替换 dex + zipalign + apksigner → 可安装 APK
 │   ├── capture.sh                # adb 无线配对 / 连接 / 抓崩溃日志
 │   ├── splitscreen.sh            # 分屏测试台（real 同屏分屏 / virt 虚拟屏 / exit / log）
@@ -91,17 +127,20 @@
 │   ├── jxctl.sh / jxq.py         # JADX 常驻查询服务（快速 grep 反编译源码）
 │   └── dexstr.py                 # DEX 字符串提取
 ├── patches/
-│   ├── README.md                 # 两个补丁的 before/after smali
+│   ├── README.md                 # 三个补丁的 before/after smali
 │   ├── mcFixDisplay.patched.smali
-│   └── NaviView.Dd.patched.smali
+│   ├── NaviView.Dd.patched.smali
+│   └── DpiScaleManager.applyImmersive.patched.smali
 ├── tools/
 │   ├── JadxServer.java           # JADX 常驻 TCP 查询服务
 │   └── Export.java               # JADX 全量源码导出
 └── .work/                        # 工作区（不入 git）
-    ├── out/amap-splitfix.apk     # ★ 补丁产物（两个修复）
+    ├── out/amap-splitfix.apk     # ★ 补丁产物（三个修复）
+    ├── out/amap-nofix3.apk       # 对照组（只修 #1+#2）
     ├── out/amap-mcfix-only-signed.apk  # 对照组（只修 #1）
     ├── patch/classes9_patched.dex
     ├── patch/classes22_patched.dex
+    ├── patch/classes25_patched.dex
     ├── keystore/amapfix2.jks
     ├── jadx-src/                 # 全量反编译源码（196 MB）
     ├── logs/                     # 运行时验证日志
@@ -136,7 +175,7 @@ java -jar /opt/rea-tools/apktool.jar b -o patched.apk smali_out # 回编译
 ## 6. 构建流程
 
 ```bash
-# 1) 生成打过补丁的 classes9.dex 与 classes22.dex
+# 1) 生成打过补丁的 classes9/22/25.dex
 bash scripts/build_patch.sh
 
 # 2) 替换进原 APK 并重签
@@ -144,7 +183,7 @@ bash scripts/build_apk.sh
 ```
 
 `build_apk.sh` 会：
-1. 逐条复制原 zip，跳过 `META-INF/*.SF|*.RSA|*.DSA|*.EC|MANIFEST.MF`，把 `classes9.dex`/`classes22.dex` 换成补丁版；
+1. 逐条复制原 zip，跳过 `META-INF/*.SF|*.RSA|*.DSA|*.EC|MANIFEST.MF`，把 `classes9.dex`/`classes22.dex`/`classes25.dex` 换成补丁版；
 2. `zipalign -f -p 4`；
 3. `apksigner sign`（v1+v2+v3，keystore `.work/keystore/amapfix2.jks`，口令 `amapfix2`）。
 
@@ -153,7 +192,7 @@ bash scripts/build_apk.sh
 ### 静态验证
 - `zipalign -c -p 4 <apk>` → OK
 - `apksigner verify --print-certs <apk>` → v2/v3 通过
-- 比对 zip 条目：只应有 `classes9.dex`、`classes22.dex` 与 `META-INF/MANIFEST.MF` 变化
+- 比对 zip 条目：只应有 `classes9.dex`、`classes22.dex`、`classes25.dex` 与 `META-INF/MANIFEST.MF` 变化
 
 ### 运行时验证（A/B 对照）
 

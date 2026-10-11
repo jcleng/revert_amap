@@ -6,6 +6,7 @@
 |---|---|---|---|
 | `mcFixDisplay.patched.smali` | `classes9.dex` | `com.byd.automap.activity.MainActivity` | 根因 1：`mcFixDisplay()` 短路为 `return false` |
 | `NaviView.Dd.patched.smali` | `classes22.dex` | `com.autosdk.drive.navi.view.NaviView` | 根因 2：`Dd()` 中给 `j5`(`lane_location`) 加判空 |
+| `DpiScaleManager.applyImmersive.patched.smali` | `classes25.dex` | `com.wzw.scale.DpiScaleManager` | 根因 3：`applyImmersive()` 不再强制沉浸式全屏 |
 
 ---
 
@@ -122,12 +123,88 @@ return v0
 
 ---
 
+## 3. `DpiScaleManager.applyImmersive.patched.smali`
+
+`com/wzw/scale/DpiScaleManager.smali` 中 `applyImmersive()` 方法**打补丁后**的完整 smali。
+
+### 问题
+
+注入代码无条件执行（`classes25.dex`，`com.wzw.*` 第三方包）：
+
+```java
+window.getDecorView().setSystemUiVisibility(5894);   // = 0x1706
+```
+
+`0x1706` = `HIDE_NAVIGATION(0x2)` + `FULLSCREEN(0x4)` + `LAYOUT_STABLE(0x100)`
++ `LAYOUT_HIDE_NAVIGATION(0x200)` + `LAYOUT_FULLSCREEN(0x400)` + `IMMERSIVE_STICKY(0x1000)`
+——沉浸式粘性全屏，**状态栏与导航栏一起隐藏**，所以界面永远全屏。
+
+### 原始（未打补丁）
+
+```smali
+    :cond_1
+    :try_start_1
+    invoke-virtual {v1}, Landroid/view/Window;->getAttributes()Landroid/view/WindowManager$LayoutParams;
+    ...
+    const/16 v2, 0x1706
+    invoke-virtual {v1, v2}, Landroid/view/View;->setSystemUiVisibility(I)V
+    ...
+    .line 120
+    :try_start_3
+    invoke-static {p0}, Lcom/wzw/voice/VoiceXtt;->attachContext(Landroid/content/Context;)V
+```
+
+### 打补丁后
+
+在 window 操作前插入 `goto`，直接跳到其后的 `VoiceXtt` 初始化：
+
+```smali
+    :cond_1
+    goto :goto_mc_no_immersive              # ← 新增
+
+    :try_start_1
+    ...（原 window 操作完整保留为死代码）...
+
+    :goto_mc_no_immersive                   # ← 新增
+    .line 120
+    :try_start_3
+    invoke-static {p0}, Lcom/wzw/voice/VoiceXtt;->attachContext(Landroid/content/Context;)V
+```
+
+**为什么保留 `VoiceXtt`**：注入的语音功能（小团团音库）初始化就写在同一个方法里，
+整段删掉会连带干掉语音。只跳过 window 操作即可。
+
+**为什么不把 `0x1706` 改成 `0x0`**：`0x0` 仍会覆盖掉宿主 App 自己可能设置的 UI 标志，
+整段不碰最安全。
+
+### 如何应用
+
+`scripts/fix_DpiScaleManager.py` 按锚点文本精确替换（断言锚点唯一），
+并断言补丁后 `0x1706` 仍存在（成为死代码）、`goto` 与标签各出现正确次数。
+
+### 产物校验
+
+打补丁后的 `classes25.dex`：
+
+- 大小 `564,664` 字节
+- SHA-256 `2d80033df968503a9813ceb85c04bcb9cb5284fa68c6e93dc9c0fccb7ab17a56`
+
+---
+
 ## 最终 APK
 
 ```
 .work/out/amap-splitfix.apk   280,064,164 字节
-sha256 e32177eec5076656497a02e967f8ad0e2ef58ee03cf8ebe2cedc25da93e9ee1d
+sha256 93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed
 ```
 
-与原包相比只有 3 个条目变化：`classes9.dex`、`classes22.dex`、`META-INF/MANIFEST.MF`
-（外加签名文件 `AMAPFIX.*` → `AMAPFIX2.*`）。
+与原包相比只有 4 个条目变化：`classes9.dex`、`classes22.dex`、`classes25.dex`、
+`META-INF/MANIFEST.MF`（外加签名文件 `AMAPFIX.*` → `AMAPFIX2.*`）。
+
+### 对照组（用于隔离每个修复的效果）
+
+| APK | SHA-256 | 含哪些修复 |
+|---|---|---|
+| `amap-mcfix-only-signed.apk` | `01de14f7620df5f47bc17620a8993a1d5e701d1a136594b8031b44dc74813cf6` | 仅 #1 |
+| `amap-nofix3.apk` | `e32177eec5076656497a02e967f8ad0e2ef58ee03cf8ebe2cedc25da93e9ee1d` | #1 + #2 |
+| `amap-splitfix.apk` | `93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed` | #1 + #2 + #3 |

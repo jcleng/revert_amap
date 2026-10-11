@@ -15,7 +15,16 @@
 #      no lane_location view -> NPE in NaviPresenter.onViewCreated -> crash.
 #      Patch: null-guard j5 exactly like the neighbouring i5 guard.
 #
-# Outputs .work/patch/classes9_patched.dex and .work/patch/classes22_patched.dex
+#  [3] classes25.dex -> DpiScaleManager.applyImmersive()
+#      The injected helper unconditionally calls
+#      window.getDecorView().setSystemUiVisibility(0x1706)  (immersive-sticky:
+#      HIDE_NAVIGATION|FULLSCREEN|LAYOUT_*|IMMERSIVE_STICKY) and forces
+#      layoutInDisplayCutoutMode=3.  That hides BOTH the status bar and the navigation
+#      bar, i.e. the app is stuck fullscreen.  The stock BYD theme does not do this
+#      (resources.arsc is untouched and contains no windowFullscreen attribute).
+#      Patch: skip the window manipulation, keep the VoiceXtt init that follows.
+#
+# Outputs .work/patch/classes{9,22,25}_patched.dex
 set -euo pipefail
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 export PATH="$JAVA_HOME/bin:$PATH"
@@ -24,6 +33,7 @@ BASE=/home/jcleng/work/mywork/revert_amap/.work
 W=$BASE/patch
 SRC9=$BASE/dex9/classes9.dex
 SRC22=$BASE/dex22/classes22.dex
+SRC25=$BASE/dex25/classes25.dex
 
 rm -rf "$W"
 mkdir -p "$W"
@@ -54,7 +64,8 @@ PY
   cd "$W"
 }
 
-patch_one "$SRC9"  classes9  /home/jcleng/work/mywork/revert_amap/scripts/fix_mcFixDisplay.py  1
-patch_one "$SRC22" classes22 /home/jcleng/work/mywork/revert_amap/scripts/fix_NaviView.py      2
+patch_one "$SRC9"  classes9  /home/jcleng/work/mywork/revert_amap/scripts/fix_mcFixDisplay.py     1
+patch_one "$SRC22" classes22 /home/jcleng/work/mywork/revert_amap/scripts/fix_NaviView.py         2
+patch_one "$SRC25" classes25 /home/jcleng/work/mywork/revert_amap/scripts/fix_DpiScaleManager.py 3
 
 echo "[done] patched dex files in $W"

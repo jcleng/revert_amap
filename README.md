@@ -11,19 +11,24 @@
 | 原包 SHA-256 | `450a1848ec6ecbda9a981598b9338f58784dcd6951a81d7ec8a8e198f10bf285` |
 | **根因 1** | 第三方重打包注入的 `MainActivity.mcFixDisplay()`（`classes9.dex`） |
 | **根因 2** | `NaviView.Dd()` 对 `j5`(= `lane_location`) 未判空 → NPE（`classes22.dex`） |
-| **修复** | #1 短路为 `return false`；#2 加判空。只改这两个 dex 并重签 |
-| 补丁包 SHA-256 | `e32177eec5076656497a02e967f8ad0e2ef58ee03cf8ebe2cedc25da93e9ee1d` |
+| **根因 3** | 第三方注入的 `DpiScaleManager.applyImmersive()` 强制沉浸式全屏，隐藏状态栏+导航栏（`classes25.dex`） |
+| **修复** | #1 短路为 `return false`；#2 加判空；#3 跳过整段 window 操作。只改这三个 dex 并重签 |
+| 补丁包 SHA-256 | `93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed` |
 
-两个 bug 的触发条件不同，**车机上分屏会同时踩到两个**：
+三个 bug 的触发条件不同，**车机上分屏会同时踩到 #1 和 #2**，#3 则与分屏无关、每次启动都生效：
 
 | | 触发条件 | 场景 |
 |---|---|---|
 | #1 `mcFixDisplay` | `getDisplay().getDisplayId() != 0` | 车机分屏 = 独立显示屏 |
 | #2 `NaviView.Dd` NPE | `isInMultiWindowMode() == true` | 同屏分屏（displayId 仍为 0） |
+| #3 `applyImmersive` | 无（每次 `onCreate` 都执行） | 界面默认全屏、状态栏/导航栏被隐藏 |
 
 ## 问题是什么
 
-在比亚迪 DiLink 车机上把高德车机版放进**分屏**后，App 会立刻退出分屏（用户感知为"闪退"）。
+两个问题，都来自同一个第三方改包：
+
+1. 在比亚迪 DiLink 车机上把高德车机版放进**分屏**后，App 会立刻退出分屏（用户感知为"闪退"）。
+2. 这个包**默认全屏**：状态栏和底部导航键被隐藏（官方包不会这样）。
 
 ## 为什么
 
@@ -93,7 +98,50 @@ private boolean mcFixDisplay() {
     :cond_j5
 ```
 
-只替换 `classes9.dex` 与 `classes22.dex`，其余 14792 个 zip 条目逐字节不变，然后重新签名。
+只替换 `classes9.dex`、`classes22.dex` 与 `classes25.dex`，其余 14791 个 zip 条目逐字节不变，然后重新签名。
+
+### 修复三：`DpiScaleManager.applyImmersive()` 不再强制全屏
+
+界面默认全屏**不是**主题造成的。`MainActivity` 的主题虽然叫
+`Theme.AppCompat.Byd.Light.NoActionBar.FullScreen.UI.Integrate`，但把它整条父链展开后
+**没有任何 `windowFullscreen` / `windowLayoutInDisplayCutoutMode` 属性**；
+而且 `resources.arsc` 的 zip 时间戳仍是 `2026-09-30`（未被重打包改动），说明资源和主题是**原版 BYD**的。
+
+真正的来源是注入的 `com/wzw/scale/DpiScaleManager.applyImmersive()`：
+
+```java
+// 全代码树里 setSystemUiVisibility 只有两处，这是被注入的那一处
+window.getDecorView().setSystemUiVisibility(5894);   // = 0x1706
+```
+
+`0x1706` = `HIDE_NAVIGATION(0x2)` + `FULLSCREEN(0x4)` + `LAYOUT_STABLE(0x100)`
++ `LAYOUT_HIDE_NAVIGATION(0x200)` + `LAYOUT_FULLSCREEN(0x400)` + `IMMERSIVE_STICKY(0x1000)`
+——**沉浸式粘性全屏，状态栏和导航栏一起隐藏**。
+它还被无条件调用：
+
+```java
+// MainActivity.java:2705-2711  onCreate()
+if (mcFixDisplay()) { return; }
+Log.e("McDebug", "logger enabled for diagnosis");   // ← 同批注入
+DpiScaleManager.applyImmersive(this);                // ← 注入的全屏
+```
+
+另一处 `setSystemUiVisibility(5380)`（`k/e/w/r.java`，值 `0x1504`，不含 `HIDE_NAVIGATION`）
+是**原版**代码：定义在未被改动的 `classes8.dex`，且有 BYD 设置 `getConfigKeySystemBarOffOn()==0` 保护。
+
+修复方式：让 `applyImmersive()` 整段 window 操作直接跳过（**保留其后的 `VoiceXtt` 初始化**，
+避免误伤注入的语音功能）：
+
+```smali
+    :cond_1
+    goto :goto_mc_no_immersive        # ← 新增
+
+    :try_start_1
+    ...getAttributes / layoutInDisplayCutoutMode / setSystemUiVisibility...（保留为死代码）
+
+    :goto_mc_no_immersive             # ← 新增
+    invoke-static {p0}, Lcom/wzw/voice/VoiceXtt;->attachContext(Landroid/content/Context;)V
+```
 
 ## 运行时验证（A/B 对照，已完成）
 
@@ -127,6 +175,22 @@ E AutoApplication: [onActivityDestroyed: activity is MainActivity]
 
 完整证据见 [`docs/findings.md`](docs/findings.md) 第 7、8 节。
 
+## 第三个根因的验证（全屏，A/B 对照）
+
+同一台手机，对照组 `amap-nofix3.apk`（`e32177ee…`，只含修复 #1+#2，`classes25.dex` 未改）
+vs 修复组 `amap-splitfix.apk`（`93f8831b…`）：
+
+| 判据 | 对照组（无 #3） | 修复组（含 #3） |
+|---|---|---|
+| `dumpsys window displays` 里 `type=statusBars visible=` | **`false`** | **`true`** |
+| logcat `WZW_DPI : applyImmersive` 次数 | 2 | **0**（`goto` 生效） |
+| logcat `WZWXTT`（VoiceXtt 仍运行） | 有 | **有**（语音未被误伤） |
+| App 窗口 `layoutInDisplayCutoutMode=always` | 有 | **无** |
+| 顶部 122px 截图 | 无状态栏内容 | 有状态栏内容，App 自带 `status_bar_bg` 可见，地图内容下移到 `y=87+` |
+
+对照实验同时确认：原包运行时 App 在前台 `statusBars visible=false`，按 Home 回桌面立刻变 `true`
+——证明是 **App 自己**隐藏了状态栏。详见 [`docs/findings.md`](docs/findings.md) 第 10 节。
+
 ## 使用方法
 
 ```bash
@@ -138,7 +202,7 @@ adb install -r .work/out/amap-splitfix.apk
 ## 自己构建
 
 ```bash
-bash scripts/build_patch.sh   # 生成打过补丁的 classes9.dex 与 classes22.dex
+bash scripts/build_patch.sh   # 生成打过补丁的 classes9/22/25.dex
 bash scripts/build_apk.sh     # 替换进原 APK + zipalign + apksigner
 ```
 
@@ -149,9 +213,10 @@ bash scripts/build_apk.sh     # 替换进原 APK + zipalign + apksigner
 ```
 docs/findings.md         完整逆向结论 + 运行时验证（主文档）
 docs/static-findings.md  静态分析速记
-scripts/build_patch.sh   dex 打补丁（两个修复）
-scripts/fix_mcFixDisplay.py  修复 #1 的 smali 改写
-scripts/fix_NaviView.py      修复 #2 的 smali 改写
+scripts/build_patch.sh   dex 打补丁（三个修复）
+scripts/fix_mcFixDisplay.py   修复 #1 的 smali 改写
+scripts/fix_NaviView.py       修复 #2 的 smali 改写
+scripts/fix_DpiScaleManager.py 修复 #3（强制全屏）的 smali 改写
 scripts/build_apk.sh     打包 + 重签
 scripts/capture.sh       adb 无线配对 / 抓崩溃日志
 scripts/splitscreen.sh   分屏测试台（real 同屏分屏 / virt 虚拟屏）

@@ -2,6 +2,8 @@
 # Build a flashable/installable patched APK:
 #   - replaces classes9.dex  with the version where MainActivity.mcFixDisplay() is a no-op
 #   - replaces classes22.dex with the version where NaviView.Dd() null-guards j5 (lane_location)
+#   - replaces classes25.dex with the version where DpiScaleManager.applyImmersive()
+#     no longer forces immersive-sticky fullscreen (status/nav bar stay visible)
 #   - re-signs v1+v2+v3 with a fresh keystore
 set -euo pipefail
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
@@ -11,6 +13,7 @@ OUT=$BASE/out
 SRC=$BASE/target.apk
 PATCH9=$BASE/patch/classes9_patched.dex
 PATCH22=$BASE/patch/classes22_patched.dex
+PATCH25=$BASE/patch/classes25_patched.dex
 KS=$BASE/keystore/amapfix2.jks
 KS_PASS=amapfix2
 
@@ -27,11 +30,12 @@ UNSIGNED=$OUT/unsigned.apk
 FINAL=$OUT/amap-splitfix-unsigned-tmp.apk
 FINALAPK=$OUT/amap-splitfix.apk
 
-python3 - "$SRC" "$UNSIGNED" "$PATCH9" "$PATCH22" <<'PY'
+python3 - "$SRC" "$UNSIGNED" "$PATCH9" "$PATCH22" "$PATCH25" <<'PY'
 import sys, zipfile
-src, dst, d9, d22 = sys.argv[1:5]
+src, dst, d9, d22, d25 = sys.argv[1:6]
 nd9 = open(d9, 'rb').read()
 nd22 = open(d22, 'rb').read()
+nd25 = open(d25, 'rb').read()
 zin = zipfile.ZipFile(src)
 zout = zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED, allowZip64=True)
 replaced = []
@@ -43,6 +47,8 @@ for item in zin.infolist():
         zout.writestr(item, nd9); replaced.append(f'{name} ({len(nd9)}b)'); continue
     if name == 'classes22.dex':
         zout.writestr(item, nd22); replaced.append(f'{name} ({len(nd22)}b)'); continue
+    if name == 'classes25.dex':
+        zout.writestr(item, nd25); replaced.append(f'{name} ({len(nd25)}b)'); continue
     zout.writestr(item, zin.read(name))
 zout.close(); zin.close()
 print("[1] repacked", dst, "-> replaced:", ", ".join(replaced), "; dropped old META-INF sigs")

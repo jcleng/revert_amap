@@ -5,16 +5,18 @@
 - SHA-256 `450a1848ec6ecbda9a981598b9338f58784dcd6951a81d7ec8a8e198f10bf285`
 - 签名者 **CN=amap-fix**（非高德官方），25 个 dex
 
-**分屏闪退有两个独立根因，都已定位并修复、都已在真机上跑通 A/B 对照：**
+**已知问题共三个，都已定位并修复、都已在真机上跑通 A/B 对照：**
 
 | # | 位置 | 根因 | 修复 | 验证方式 |
 |---|---|---|---|---|
 | 1 | `classes9.dex` `MainActivity.mcFixDisplay()` | 第三方注入的 hack：`displayId != 0` 时强行走 `moveTaskToDisplay(0)` 或 `NEW_TASK\|CLEAR_TASK` 重启，把 App 从分屏里拽出去 | 该方法改成 no-op（恒 `return false`） | 虚拟屏 `displayId=2` A/B，见 §7 |
 | 2 | `classes22.dex` `NaviView.Dd()` | `this.j5.setOnClickListener(...)` 未判空，而 `j5` = `R.id.lane_location` 在 `fragment_auto_navi_half`（多窗口/非平台化时选用的布局）里**不存在** → NPE 闪退 | 给 `j5` 加判空，与相邻的 `i5` 判空写法一致 | 手机真实分屏 + 导航，见 §8 |
+| 3 | `classes25.dex` `DpiScaleManager.applyImmersive()` | 第三方注入的沉浸式全屏：无条件 `setSystemUiVisibility(0x1706)`（`HIDE_NAVIGATION\|FULLSCREEN\|LAYOUT_*\|IMMERSIVE_STICKY`）并强制 `layoutInDisplayCutoutMode=3`，导致**状态栏与导航栏同时被隐藏**、界面永远全屏 | 跳过整段 window 操作（保留其后的 VoiceXtt 初始化） | 手机 A/B：`dumpsys window displays` 里 `statusBars visible` 由 `false` 变 `true`，见 §10 |
 
-两者触发条件不同：**#1 只在 `displayId != 0` 时触发**（车机分屏 = 独立显示屏）；
-**#2 只在 `isInMultiWindowMode() == true` 时触发**（含 `displayId` 仍为 0 的同屏分屏）。
-车机上分屏同时满足两个条件，所以两个都必须修。
+触发条件各不相同：**#1 只在 `displayId != 0` 时触发**（车机分屏 = 独立显示屏）；
+**#2 只在 `isInMultiWindowMode() == true` 时触发**（含 `displayId` 仍为 0 的同屏分屏）；
+**#3 每次启动都触发**（与分屏无关，是独立的全屏问题）。
+车机上分屏同时满足 #1 与 #2，所以两个都必须修；#3 则解释了“为什么官方包不会默认全屏”。
 
 ## 1. 这个包已经被第三方改过（关键前提）
 
@@ -86,32 +88,41 @@ private boolean mcFixDisplay() {
 
 见 §8。
 
-### 3.3 产物
+### 3.3 修复三：`DpiScaleManager.applyImmersive()` 不再强制全屏
+
+见 §10。
+
+### 3.4 产物
 
 ```
 .work/patch/classes9_patched.dex    2,107,408 字节
   sha256 5ed376368a9edf17a1f035c7274f00895a2c820f8f65902ad46839a5baced463
 .work/patch/classes22_patched.dex   3,549,488 字节
   sha256 8dd4b7d3faf384243082b7019dae7e07dfed78eef6ae7758d79ca5b6ed6b17fe
+.work/patch/classes25_patched.dex     564,664 字节
+  sha256 2d80033df968503a9813ceb85c04bcb9cb5284fa68c6e93dc9c0fccb7ab17a56
 
-.work/out/amap-splitfix.apk       280,064,164 字节   ← 两个修复都在里面，推荐使用
+.work/out/amap-splitfix.apk       280,064,164 字节   ← 三个修复都在里面，推荐使用
+  sha256 93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed
+
+.work/out/amap-nofix3.apk         280,064,164 字节 ← 只修 #1+#2 的对照组，用于证明 #3 的存在
   sha256 e32177eec5076656497a02e967f8ad0e2ef58ee03cf8ebe2cedc25da93e9ee1d
 
 .work/out/amap-mcfix-only-signed.apk 280,064,164 字节 ← 只修 #1 的对照组，用于证明 #2 的存在
   sha256 01de14f7620df5f47bc17620a8993a1d5e701d1a136594b8031b44dc74813cf6
 ```
 
-构建方式（只动 `classes9.dex` 与 `classes22.dex`，其余 14792 个条目逐字节不变）：
+构建方式（只动 `classes9/22/25.dex`，其余 14791 个条目逐字节不变）：
 
 ```bash
-bash scripts/build_patch.sh   # baksmali 两个 dex → 应用 scripts/fix_*.py → smali 回 dex
+bash scripts/build_patch.sh   # baksmali 三个 dex → 应用 scripts/fix_*.py → smali 回 dex
 bash scripts/build_apk.sh     # 替换进原 APK（丢弃旧 META-INF 签名）→ zipalign → apksigner(v1+v2+v3)
 ```
 
 校验：
 - `zipalign -c -p 4` → OK
 - `apksigner verify` → v2/v3 通过
-- 新 dex 与原 APK 其余所有条目逐字节比对：仅 `classes9.dex`、`classes22.dex` 与 `META-INF/MANIFEST.MF` 变化，其余完全一致
+- 新 dex 与原 APK 其余所有条目逐字节比对：仅 `classes9.dex`、`classes22.dex`、`classes25.dex` 与 `META-INF/MANIFEST.MF` 变化，其余完全一致
 - 改后 dex 可被 apktool 重新反编译，确认方法体与预期一致
 
 ## 4. 签名风险已排查（可以放心重签）
@@ -383,4 +394,126 @@ public static boolean isPlatformUI() {
 ```bash
 adb uninstall com.autonavi.amapauto
 adb install -r .work/out/amap-splitfix.apk
+```
+
+---
+
+# 10. 第三个根因：注入代码强制沉浸式全屏（界面永远全屏）
+
+## 10.1 现象
+
+安装这个改包后，App 界面**默认全屏**：状态栏和底部导航键都被隐藏，和官方包行为不一致。
+
+## 10.2 排查：先排除"主题自带全屏"
+
+`MainActivity` 的主题是
+`@style/Theme.AppCompat.Byd.Light.NoActionBar.FullScreen.UI.Integrate`（`0x7f13039f`），
+名字里带 `FullScreen`，很像是资源层面的全屏。但逐级展开主题父链后可以排除：
+
+| 主题 | `windowFullscreen` (0x0101020c) | `windowLayoutInDisplayCutoutMode` |
+|---|---|---|
+| `Theme.AppCompat.Byd.Light.NoActionBar.FullScreen.UI.Integrate` | 无 | 无 |
+| `Theme.AppCompat.Byd.DayNight.NoActionBar` | 无 | 无 |
+| `Theme.AppCompat.Byd.NoActionBar` | 无 | 无 |
+| `Theme.AppCompat.Byd` | 无 | 无 |
+| `Base.Theme.AppCompat.Byd` | 无 | 无 |
+| …（一直到 `Platform.V25.AppCompat`） | 无 | 无 |
+
+关键旁证：**`resources.arsc` 的 zip 时间戳仍是 2026-09-30**（未被重打包改动过），
+而三个被注入改写的 dex 时间戳分别是 2026-10-07 / 2026-10-01 / 2026-10-01。
+也就是说主题与资源是**原版 BYD**的，主题链里根本没有 `windowFullscreen` 属性。
+
+## 10.3 真凶：注入的 `DpiScaleManager.applyImmersive()`
+
+全代码树里 `setSystemUiVisibility(...)` 只有两处调用：
+
+| 位置 | 值 | 判断 |
+|---|---|---|
+| `k/e/w/r.java:112` | `5380` = `0x1504` = `FULLSCREEN\|LAYOUT_STABLE\|LAYOUT_FULLSCREEN\|IMMERSIVE_STICKY` | **原版**：定义在 `classes8.dex`（未被改动），且被 BYD 设置 `getConfigKeySystemBarOffOn()==0` 保护 |
+| `com/wzw/scale/DpiScaleManager.java:102` | `5894` = `0x1706` = `HIDE_NAVIGATION\|FULLSCREEN\|LAYOUT_STABLE\|LAYOUT_HIDE_NAVIGATION\|LAYOUT_FULLSCREEN\|IMMERSIVE_STICKY` | **注入**：`com.wzw.*` 第三方包，定义在 `classes25.dex`（2026-10-01 被改） |
+
+`0x1706` 里多了 `HIDE_NAVIGATION(0x2)` 与 `LAYOUT_HIDE_NAVIGATION(0x200)`，
+即**状态栏和导航栏一起隐藏**的沉浸式粘性全屏 —— 与"界面永远全屏"的现象完全吻合。
+
+调用点：
+
+```java
+// com/byd/automap/activity/MainActivity.java:2705-2711  onCreate()
+super.onCreate(bundle);
+if (mcFixDisplay()) { return; }
+Logger.setLog(true);
+Log.e("McDebug", "logger enabled for diagnosis");   // ← 同批注入的日志
+DpiScaleManager.applyImmersive(this);                // ← 注入的全屏
+```
+
+`applyImmersive()` 还无条件把 `layoutInDisplayCutoutMode` 设为 3（`ALWAYS`），
+并顺带调用注入的 `VoiceXtt.attachContext()/installAsync()`（小团团语音）。
+它**没有任何用户开关**（`DpiScaleManager` 的 SharedPreferences `wzw_dpi_scale`
+只有 `map`/`ui` 两个缩放键）。
+
+## 10.4 运行时证据（原包，未打补丁）
+
+| 检查 | 结果 |
+|---|---|
+| 启动日志 | `I WZW_DPI : applyImmersive sdk=36` |
+| App 在前台 `dumpsys window displays \| grep type=statusBars` | `visible=false` |
+| 按 Home 回桌面后同一命令 | `visible=true` |
+| `dumpsys window windows`（App 窗口 `mAttrs`） | 含 `layoutInDisplayCutoutMode=always` |
+
+App 在前台时状态栏 `visible=false`、退到后台立刻变 `true`，说明是 **App 自己**把它隐藏的。
+
+## 10.5 修复
+
+`applyImmersive()` 里整段 window 操作（`getAttributes` / `layoutInDisplayCutoutMode`
+/ `setSystemUiVisibility`）直接跳过，**保留其后的 `VoiceXtt` 初始化**，
+避免连带干掉注入的语音功能：
+
+```smali
+    :cond_1
+    goto :goto_mc_no_immersive        # ← 新增：跳过整段 window 操作
+
+    :try_start_1
+    invoke-virtual {v1}, Landroid/view/Window;->getAttributes()...
+    ...（原代码保留为死代码）...
+
+    :goto_mc_no_immersive             # ← 新增：跳转目标
+    .line 120
+    :try_start_3
+    invoke-static {p0}, Lcom/wzw/voice/VoiceXtt;->attachContext(Landroid/content/Context;)V
+```
+
+选择"跳过"而不是"改 `0x1706` 为 `0x0`"，是因为 `0x0` 仍会覆盖掉宿主 App 自己
+可能设置的 UI 标志；整段不碰最安全。也不删整个方法，因为 `VoiceXtt` 初始化在里面。
+
+脚本：`scripts/fix_DpiScaleManager.py`（锚点唯一性有断言保护）。
+
+## 10.6 A/B 对照（手机，同一台设备、同一 APK 其余条目逐字节相同）
+
+对照组 `amap-nofix3.apk`（`e32177ee…`，只含修复 #1+#2，`classes25.dex` 未改）
+vs 修复组 `amap-splitfix.apk`（`93f8831b…`，三个修复都含）：
+
+| 判据 | 对照组（无 #3） | 修复组（含 #3） |
+|---|---|---|
+| `type=statusBars visible=` | **`false`** | **`true`** |
+| logcat `WZW_DPI : applyImmersive` 出现次数 | 2 | **0**（证明 `goto` 生效） |
+| logcat `WZWXTT`（VoiceXtt 仍在跑） | 有 | **有**（证明语音未被误伤） |
+| App 窗口 `mAttrs` 里的 `layoutInDisplayCutoutMode=always` | 有 | **无** |
+| 状态栏 122px 区域截图 | 无状态栏内容（`std=0.054`） | 有状态栏内容（`std=0.157`） |
+| `uiautomator dump` 顶部节点 | — | App 自带 `status_bar_bg` (ImageView) 位于 `y=0..122`，地图内容下移到 `y=87+` |
+| 进程存活 / `FATAL EXCEPTION` | 存活 / 0 | 存活 / 0 |
+
+日志：`.work/logs/immersive-nofix3.log`（对照）、`.work/logs/immersive-fixed.log`（修复），
+截图：`.work/logs/immersive-nofix3.png`、`.work/logs/immersive-fixed.png`。
+
+## 10.7 三个修复叠加后的整体回归
+
+`scripts/repro_navi_npe.sh`（真实分屏 + 搜索 + 起导航）在三个修复都打上的包上：
+
+```
+pid=16022                  ← 进程存活（对照组此处置空 = 闪退）
+NaviView.Dd           0    ← 无 NPE
+FATAL EXCEPTION       0
+mInSplitScreen=true   9
+isInMultiWindowMode:true  1
+type=statusBars visible=true   ← 分屏导航中状态栏依然可见
 ```
