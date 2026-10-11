@@ -1,56 +1,60 @@
 #!/bin/bash
-# Patch classes9.dex: neutralize the injected MainActivity.mcFixDisplay() hack.
-# Rationale: mcFixDisplay() forcibly moves the task back to display 0 (or relaunches
-# MainActivity with NEW_TASK|CLEAR_TASK when that reflection call fails). BYD split
-# screen runs the app on a non-zero display, so this injected code yanks the app out
-# of split screen / restarts it -> observed as a crash (闪退).
+# Patch the two injected/buggy code paths found during the reverse engineering:
+#
+#  [1] classes9.dex  -> MainActivity.mcFixDisplay()
+#      The injected BYD fix-up hack forces the task back onto display 0
+#      (or, when the ActivityTaskManager reflection is denied, relaunches
+#      MainActivity with NEW_TASK|CLEAR_TASK).  BYD split screen runs the app on a
+#      non-zero display, so this yanks the app out of split screen / restarts it ->
+#      observed as 闪退.  Patch: make it a no-op (always return false).
+#
+#  [2] classes22.dex -> NaviView.Dd()
+#      Dd() unconditionally does  this.j5.setOnClickListener(this.X6)  while j5 is
+#      findViewById(R.id.lane_location).  fragment_auto_navi_half (the layout used
+#      when the platform is NOT "platformized", e.g. while isInMultiWindowMode()) has
+#      no lane_location view -> NPE in NaviPresenter.onViewCreated -> crash.
+#      Patch: null-guard j5 exactly like the neighbouring i5 guard.
+#
+# Outputs .work/patch/classes9_patched.dex and .work/patch/classes22_patched.dex
 set -euo pipefail
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 export PATH="$JAVA_HOME/bin:$PATH"
 APKTOOL=/opt/rea-tools/apktool.jar
 BASE=/home/jcleng/work/mywork/revert_amap/.work
 W=$BASE/patch
-SRC=$BASE/dex9/classes9.dex
+SRC9=$BASE/dex9/classes9.dex
+SRC22=$BASE/dex22/classes22.dex
 
 rm -rf "$W"
 mkdir -p "$W"
-cd "$W"
-cp "$SRC" classes.dex
-python3 - <<'PY'
+
+patch_one() {
+  local src="$1" outname="$2" fixer="$3" label="$4"
+  local d="$W/$outname"
+  mkdir -p "$d"
+  cd "$d"
+  cp "$src" classes.dex
+  python3 - <<'PY'
 import zipfile
 z = zipfile.ZipFile('in.apk', 'w', zipfile.ZIP_DEFLATED)
 z.write('classes.dex', 'classes.dex')
 z.close()
 PY
-java -Xmx4g -jar "$APKTOOL" d -f -o smali_out in.apk >/dev/null
-echo "[1] baksmali: $(find smali_out -name '*.smali' | wc -l) smali files"
-
-python3 - <<'PY'
-p = 'smali_out/smali/com/byd/automap/activity/MainActivity.smali'
-s = open(p, encoding='utf-8').read()
-old = """.method private mcFixDisplay()Z
-    .locals 7
-
-    invoke-virtual {p0}, Landroid/app/Activity;->getDisplay()Landroid/view/Display;"""
-new = """.method private mcFixDisplay()Z
-    .locals 7
-
-    const/4 v0, 0x0
-
-    return v0
-
-    invoke-virtual {p0}, Landroid/app/Activity;->getDisplay()Landroid/view/Display;"""
-n = s.count(old)
-assert n == 1, f"anchor count = {n}"
-open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
-print("[2] patched mcFixDisplay -> always return false")
-PY
-
-java -Xmx4g -jar "$APKTOOL" b -o patched.apk smali_out >/dev/null
-python3 - <<'PY'
-import zipfile, hashlib
+  java -Xmx4g -jar "$APKTOOL" d -f -o smali_out in.apk >/dev/null
+  echo "[$label] baksmali: $(find smali_out -name '*.smali' | wc -l) smali files"
+  python3 "$fixer"
+  java -Xmx4g -jar "$APKTOOL" b -o patched.apk smali_out >/dev/null
+  python3 - "$outname" <<'PY'
+import zipfile, hashlib, sys, os
 d = zipfile.ZipFile('patched.apk').read('classes.dex')
-open('classes9_patched.dex', 'wb').write(d)
-print("[3] classes9_patched.dex:", len(d), "bytes")
-print("    sha256", hashlib.sha256(d).hexdigest())
+out = os.path.join('..', sys.argv[1] + '_patched.dex')
+open(out, 'wb').write(d)
+print(f"    -> {out}: {len(d)} bytes  sha256 {hashlib.sha256(d).hexdigest()}")
 PY
+  cd "$W"
+}
+
+patch_one "$SRC9"  classes9  /home/jcleng/work/mywork/revert_amap/scripts/fix_mcFixDisplay.py  1
+patch_one "$SRC22" classes22 /home/jcleng/work/mywork/revert_amap/scripts/fix_NaviView.py      2
+
+echo "[done] patched dex files in $W"
