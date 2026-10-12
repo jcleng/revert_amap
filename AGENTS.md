@@ -212,8 +212,8 @@ classes18 / classes21 / classes22 / classes25` 共 10 个 dex，其余 zip 条�
   SHA-256 `93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed`
 - **共存版（改包名，推荐装车）**：`.work/out/amap-splitfix-lite.apk`（修复 #1–#6）
   SHA-256 `f1d17de2ca1576112151c59c9de3fdd9478306c6ab13c7b05cedc07d162a293f`
-- 对照组（fix#1..#4 + 改名 + 6a 标签，无 #5/#6b，用于证明 #5 与 #6b）：
-  `.work/out/amap-nofix5.apk`
+- 对照组（fix#1..#4 + 改名，无 #5/#6，用于证明 #5）：`.work/out/amap-nofix5.apk`
+  （其 `classes8.dex` 与修复前逐字节相同；`charge_station` 仍为「加油站」，`classes21.dex` 为原版）
 - 对照组（fix#1..#6a + 改名，`classes21.dex` 回退为原版，用于证明 #6b）：
   `.work/out/amap-ctl-carutils.apk`
   SHA-256 `361b64b00aa10b021fd6bc8ebd3540c89fef14836e397a3a35e840c0d31b854a`
