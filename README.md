@@ -13,10 +13,12 @@
 | **根因 1** | 第三方重打包注入的 `MainActivity.mcFixDisplay()`（`classes9.dex`） |
 | **根因 2** | `NaviView.Dd()` 对 `j5`(= `lane_location`) 未判空 → NPE（`classes22.dex`） |
 | **根因 3** | 第三方注入的 `DpiScaleManager.applyImmersive()` 强制沉浸式全屏，隐藏状态栏+导航栏（`classes25.dex`） |
-| **修复** | #1 短路为 `return false`；#2 加判空；#3 跳过整段 window 操作。只改这三个 dex 并重签 |
-| 补丁包 SHA-256 | `93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed`（原名）<br>`087ab9463af593fb5ab394896d7add0a5e002da43f8680753cd36feb6a771c10`（改包名版 `amap-splitfix-lite.apk`） |
+| **根因 4** | 预装同包名应用签名不同 → `INSTALL_FAILED_UPDATE_INCOMPATIBLE`（车机显示「与现有软件冲突」） |
+| **根因 5** | `UserFavoritesPresenter.v0()` 在原生线程上直接 `TextView.setText()` → `CalledFromWrongThreadException`（`classes8.dex`，**原包自带老 bug**） |
+| **修复** | #1 短路为 `return false`；#2 加判空；#3 跳过整段 window 操作；#5 给 `v0()` 加主线程守卫；#4 改包名共存。只改 4 个 dex 并重签 |
+| 补丁包 SHA-256 | `93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed`（原名）<br>`6d19e40c8d098ea8e58ae9e9625c7b796f5cceb8beb71f0163ba303ed110ce49`（改包名版 `amap-splitfix-lite.apk`，含修复 #1–#5） |
 
-三个 bug 的触发条件不同，**车机上分屏会同时踩到 #1 和 #2**，#3 则与分屏无关、每次启动都生效：
+五个 bug 的触发条件不同，**车机上分屏会同时踩到 #1 和 #2**，#3 则与分屏无关、每次启动都生效：
 
 | | 触发条件 | 场景 |
 |---|---|---|
@@ -24,6 +26,7 @@
 | #2 `NaviView.Dd` NPE | `isInMultiWindowMode() == true` | 同屏分屏（displayId 仍为 0） |
 | #3 `applyImmersive` | 无（每次 `onCreate` 都执行） | 界面默认全屏、状态栏/导航栏被隐藏 |
 | #4 包名冲突 | 车机已装原装高德 | 安装报「与现有软件冲突」，装不上 |
+| #5 收藏夹线程 | 设置 → 我的 → 收藏夹 | 同步回调从原生线程更新 UI → 闪退 |
 
 ## 问题是什么
 
@@ -145,6 +148,41 @@ DpiScaleManager.applyImmersive(this);                // ← 注入的全屏
     invoke-static {p0}, Lcom/wzw/voice/VoiceXtt;->attachContext(Landroid/content/Context;)V
 ```
 
+### 修复五：`UserFavoritesPresenter.v0()` 加主线程守卫
+
+登录后进 **设置 → 我的 → 收藏夹** 必闪退。同步 SDK 的原生线程池（`bl_thd_pool_worker`，
+该字符串只存在于 `lib/arm64-v8a/libGComm3rd.so`）回调进来后一路同步执行到
+`v0()` → `k.e.v.j.f.f.h2()` → `updateViewText()` → `TextView.setText()`，
+在主线程之外碰 View → `CalledFromWrongThreadException` → `HMI callback exception` → FATAL。
+
+`notify()` 里其余调用（`d2()`/`j2()` 走 `TaskManager.post`、`t0()`/`s0()`/`u0()` 走
+RxJava `observeOn(mainThread)`、`X0()` 是 SharedPreferences 写入）**都已经是线程安全的**，
+`v0()` 是唯一裸的 UI 操作。**这是原包自带的老 bug**，不是补丁引入的。
+
+```smali
+.method public v0()V
+    .locals 9
+    invoke-static {}, Landroid/os/Looper;->myLooper()Landroid/os/Looper;
+    move-result-object v0
+    invoke-static {}, Landroid/os/Looper;->getMainLooper()Landroid/os/Looper;
+    move-result-object v1
+    if-eq v0, v1, :cond_v0_main     # 已在主线程 -> 原逻辑；否则 post 后返回
+    new-instance v0, Lk/e/v/h/c/m;
+    invoke-direct {v0, p0}, Lk/e/v/h/c/m;-><init>(...UserFavoritesPresenter;)V
+    invoke-static {v0}, Lcom/autosdk/bussiness/common/task/TaskManager;->post(Ljava/lang/Runnable;)V
+    return-void
+    :cond_v0_main
+    ...原 v0() 逻辑...
+```
+
+> ⚠️ 必须 `if-eq`（相等才跳转）。用 `if-ne` 会反转判断：主线程调用 → post 分支 →
+> `TaskManager.post` 在主线程**内联执行** → 再次进 `v0()` → 无限递归 `StackOverflowError`。
+
+**正确的复现入口是「设置 → 我的 → 收藏夹」，不是首页右上角的收藏图标**
+——后者打开的是搜索模块的收藏页（`slv_search_favorite`），根本不创建
+`UserFavoritesPresenter`，早期测试因此全是假阴性。脚本：`scripts/goto_favorites.sh`、
+`scripts/ab_favorites_crash.sh`。
+
 ## 运行时验证（A/B 对照，已完成）
 
 在 Redmi 手机（Android 16）上用 overlay 虚拟屏模拟车机分屏（`settings put global overlay_display_devices '1280x720/213'` → 得到 `displayId=2`，系统名为 `叠加视图 #1`），再用 `am start --display 2` 启动高德。
@@ -193,6 +231,21 @@ vs 修复组 `amap-splitfix.apk`（`93f8831b…`）：
 对照实验同时确认：原包运行时 App 在前台 `statusBars visible=false`，按 Home 回桌面立刻变 `true`
 ——证明是 **App 自己**隐藏了状态栏。详见 [`docs/findings.md`](docs/findings.md) 第 10 节。
 
+## 第五个根因的验证（收藏夹闪退，A/B 对照）
+
+同一台手机，入口 = 设置 → 我的 → 收藏夹。对照组 `amap-nofix5.apk`（fix#1..#4 + 改包名，
+`classes8.dex` 与修复前逐字节相同）vs 修复组 `amap-splitfix-lite.apk`：
+
+| 判据 | 对照组（无 #5） | 修复组（含 #5） |
+|---|---|---|
+| 进程存活 | **否（闪退）** | **是** |
+| `CalledFromWrongThread` | **11** | **0** |
+| `HMI callback exception` | **10** | **0** |
+| `FATAL EXCEPTION` | **1** | **0** |
+| 收藏页 `slv_favorite_list` | — | 渲染成功 |
+
+详见 [`docs/findings.md`](docs/findings.md) 第 12 节。
+
 ## 使用方法
 
 装到**已预装高德**的车机上（要共存）用改包名版：
@@ -226,16 +279,19 @@ AIDL token 必须跟着改）见 [`docs/findings.md`](docs/findings.md) 第 11 �
 ```
 docs/findings.md         完整逆向结论 + 运行时验证（主文档）
 docs/static-findings.md  静态分析速记
-scripts/build_patch.sh   dex 打补丁（三个修复）
+scripts/build_patch.sh   dex 打补丁（五个修复）
 scripts/fix_mcFixDisplay.py   修复 #1 的 smali 改写
 scripts/fix_NaviView.py       修复 #2 的 smali 改写
 scripts/fix_DpiScaleManager.py 修复 #3（强制全屏）的 smali 改写
+scripts/fix_UserFavorites.py  修复 #5（收藏夹线程）的 smali 改写 + 新增 Runnable 类
 scripts/fix_RenamePackage.py   dex 侧改包名（类型描述符 + 选择性字符串 + 目录搬迁）
 scripts/rename_pkg_binary.py   二进制改 AndroidManifest.xml / resources.arsc 的包名
 scripts/build_apk.sh     改包名 + 打包 + 重签
 scripts/capture.sh       adb 无线配对 / 抓崩溃日志
 scripts/splitscreen.sh   分屏测试台（real 同屏分屏 / virt 虚拟屏）
 scripts/repro_navi_npe.sh 一键复现 #2（真机真实分屏）
+scripts/goto_favorites.sh 导航到 #5 的真实崩溃入口（设置→我的→收藏夹）
+scripts/ab_favorites_crash.sh 一键复现 #5 + A/B 统计
 tools/JadxServer.java    JADX 常驻查询服务（加速反复 grep）
 AGENTS.md                Agent / 开发者操作指南
 ```

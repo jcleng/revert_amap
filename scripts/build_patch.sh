@@ -24,13 +24,23 @@
 #      (resources.arsc is untouched and contains no windowFullscreen attribute).
 #      Patch: skip the window manipulation, keep the VoiceXtt init that follows.
 #
+#  [5] classes8.dex -> UserFavoritesPresenter.v0()
+#      The sync-SDK observer callback (native GBL "bl_thd_pool_worker" thread) ends up
+#      in v0() -> k.e.v.j.f.f.h2() -> k.e.j.d.j0.updateViewText() -> TextView.setText(),
+#      i.e. a View is touched from a non-main thread ->
+#      ViewRootImpl$CalledFromWrongThreadException -> "HMI callback exception" -> FATAL.
+#      Every other call in that notify() chain is already thread-safe; v0() is the only
+#      direct View touch.  Patch: guard v0() with a main-looper check and re-dispatch via
+#      TaskManager.post() (the same helper d2()/j2() already use; it runs inline when
+#      already on main).
+#
 #  [4] classes.dex, 5, 8, 9, 11, 13, 18, 21, 22, 25 -> package rename
 #      The car head unit ships a system-signed com.autonavi.amapauto, so installing
 #      this build over it fails with INSTALL_FAILED_UPDATE_INCOMPATIBLE (shown by the
 #      head unit as "与现有软件冲突").  Renaming the package lets it coexist as a
 #      separate app.  See scripts/fix_RenamePackage.py for the KEEP list.
 #
-# Outputs .work/patch/classes{9,22,25}_patched.dex and, for the renamed dexes,
+# Outputs .work/patch/classes{8,9,22,25}_patched.dex and, for the renamed dexes,
 # .work/patch/classes{0,5,8,9,11,13,18,21,22,25}_pkg.dex
 set -euo pipefail
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
@@ -38,6 +48,7 @@ export PATH="$JAVA_HOME/bin:$PATH"
 APKTOOL=/opt/rea-tools/apktool.jar
 BASE=/home/jcleng/work/mywork/revert_amap/.work
 W=$BASE/patch
+SRC8=$BASE/dex8/classes8.dex
 SRC9=$BASE/dex9/classes9.dex
 SRC22=$BASE/dex22/classes22.dex
 SRC25=$BASE/dex25/classes25.dex
@@ -98,6 +109,7 @@ PY
   cd "$W"
 }
 
+patch_one "$SRC8"  classes8  /home/jcleng/work/mywork/revert_amap/scripts/fix_UserFavorites.py   5
 patch_one "$SRC9"  classes9  /home/jcleng/work/mywork/revert_amap/scripts/fix_mcFixDisplay.py     1
 patch_one "$SRC22" classes22 /home/jcleng/work/mywork/revert_amap/scripts/fix_NaviView.py         2
 patch_one "$SRC25" classes25 /home/jcleng/work/mywork/revert_amap/scripts/fix_DpiScaleManager.py 3
@@ -109,6 +121,7 @@ for spec in "0:classes" "5:classes5" "8:classes8" "9:classes9" "11:classes11" \
             "13:classes13" "18:classes18" "21:classes21" "22:classes22" "25:classes25"; do
   idx=${spec%%:*}; name=${spec##*:}
   case "$name" in
+    classes8)  src="$W/classes8_patched.dex" ;;
     classes9)  src="$W/classes9_patched.dex" ;;
     classes22) src="$W/classes22_patched.dex";;
     classes25) src="$W/classes25_patched.dex";;

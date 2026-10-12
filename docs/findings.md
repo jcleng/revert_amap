@@ -643,3 +643,145 @@ package:com.autonavi.amapautolite            ← 新包共存
 为键的系统集成（语音唤醒、方向盘按键、仪表/HUD 投射、
 `json_protocol_service` / `carlie` AIDL）仍会绑定到**车机原装的那个**应用，
 不会自动接到我们这个共存包上。这是「与原装共存」的必然代价。
+
+---
+
+# 12. 修复 #5：个人中心 → 收藏夹 闪退（`CalledFromWrongThreadException`）
+
+## 12.1 现象
+
+登录后进入 **设置 → 我的 → 收藏夹**，App 立刻闪退。Logcat：
+
+```
+FATAL EXCEPTION: main
+Process: com.autonavi.amapautolite, PID: 9891
+java.lang.RuntimeException: HMI callback exception:ThreadId(15544):
+  android.view.ViewRootImpl$CalledFromWrongThreadException:
+  Only the original thread that created a view hierarchy can touch its views.
+  Expected: main  Calling: bl_thd_pool_wor
+    android.view.ViewRootImpl.checkThread(ViewRootImpl.java:13447)
+    android.view.ViewRootImpl.requestLayout(ViewRootImpl.java:3564)
+    android.view.View.requestLayout(View.java:30022)
+    android.widget.AbsListView.requestLayout(AbsListView.java:2124)
+    android.widget.TextView.checkForRelayout(TextView.java:11812)
+    android.widget.TextView.setText(TextView.java:7557)
+    k.e.j.d.j0.updateViewText(Unknown Source:6)
+    k.e.v.j.f.f.h2(Unknown Source:47)
+    com.autosdk.user.presenter.behavior.UserFavoritesPresenter.v0
+    com.autosdk.user.presenter.behavior.UserFavoritesPresenter$3.notify
+    com.autosdk.bussiness.user.model.SyncSdkModel.notify
+    com.autonavi.gbl.user.router.SyncSDKServiceObserverRouter.notify
+    com.autonavi.gbl.user.router.SyncsdkObserverJNI.SwigDirector_...
+    com.byd.hotfix.ExceptionProcessImpl$1.handleMessage
+```
+
+## 12.2 崩溃链
+
+```
+SyncSDK 原生回调（GBL 线程池 "bl_thd_pool_worker"）
+  -> SyncSDKServiceObserverRouter.notify
+  -> SyncSdkModel.notify(4, 0)                // SyncSdkEventSyncEnd = 4
+  -> UserFavoritesPresenter$3.notify(4, 0)
+  -> UserFavoritesPresenter.v0()
+  -> k.e.v.j.f.f.h2()
+  -> k.e.j.d.j0.updateViewText()
+  -> TextView.setText()  ->  requestLayout()  ->  ViewRootImpl.checkThread()
+  -> CalledFromWrongThreadException
+  -> ExceptionProcessImpl$1.handleMessage 在主线程重新抛出 RuntimeException
+  -> FATAL EXCEPTION
+```
+
+`bl_thd_pool` 这个字符串**只存在于 `lib/arm64-v8a/libGComm3rd.so`**，
+说明回调来自原生线程池，不是 Java 线程。
+
+## 12.3 根因（静态 + 运行时确认）
+
+`notify()` 里所有调用**只有 `v0()` 是裸的 View 操作**，其余都已经是线程安全的：
+
+| `notify()` 内的调用 | 线程安全性 |
+|---|---|
+| `d2()` / `j2()` | `TaskManager.post(...)` 已经派发到主线程 |
+| `X0()` → `W0()` | SharedPreferences 写入，本身线程安全 |
+| `t0()` / `s0()` / `u0()` | RxJava `.observeOn(mainThread)` 已经派发 |
+| **`v0()`** | **直接 `TextView.setText()`，无任何保护** ← 唯一真凶 |
+
+**这是原包（BYD/高德集成层）自带的老 bug，不是我们补丁引入的。**
+用未修改的 `classes8.dex` 同样必崩（见 12.6 对照组）。
+
+## 12.4 修复
+
+在 `v0()` 入口插入主线程守卫：非主线程时通过 `TaskManager.post(...)` 重新派发后返回。
+`TaskManager.post()` 在已经在主线程时会**内联执行**，因此主线程调用路径行为完全不变。
+
+```smali
+.method public v0()V
+    .locals 9
+
+    invoke-static {}, Landroid/os/Looper;->myLooper()Landroid/os/Looper;
+    move-result-object v0
+    invoke-static {}, Landroid/os/Looper;->getMainLooper()Landroid/os/Looper;
+    move-result-object v1
+    if-eq v0, v1, :cond_v0_main          # 已在主线程 -> 直接跑原逻辑
+
+    new-instance v0, Lk/e/v/h/c/m;        # 否则 post 到主线程再跑
+    invoke-direct {v0, p0}, Lk/e/v/h/c/m;-><init>(...UserFavoritesPresenter;)V
+    invoke-static {v0}, Lcom/autosdk/bussiness/common/task/TaskManager;->post(Ljava/lang/Runnable;)V
+    return-void
+
+    :cond_v0_main
+    ...原 v0() 逻辑...
+```
+
+新增 `Lk/e/v/h/c/m;`（`Runnable` 转发到 `v0()`）。
+选这个包名是因为 `k/e/v/h/c/` 下 `a..l` 已经是 `UserFavoritesPresenter` 的合成 lambda，
+`m` 全 dex 未占用，且不受改包名影响。
+
+### ⚠️ 分支方向（踩过的坑）
+
+**必须用 `if-eq`（相等才跳转）**，不能用 `if-ne`。
+
+- `if-eq v0, v1, :cond` = `myLooper() == getMainLooper()` 时进入原逻辑 ✔
+- 用了 `if-ne` 会反转判断：主线程调用 → 走 post 分支 → `TaskManager.post` 在主线程**内联执行**
+  → 再次进入 `v0()` → 再次 post → **无限递归 `StackOverflowError`**（实测 8188KB 栈爆掉）。
+- `myLooper()==null`（原生线程）→ 与主 Looper 不等 → 走 post 分支，行为正确。
+
+## 12.5 正确的复现路径（关键）
+
+**入口是「设置」页里的「我的」标签，不是首页的收藏图标。**
+
+首页右上角的 `siv_favorite_entry` 打开的是**搜索模块的收藏页**
+（列表 id = `slv_search_favorite`），根本不会创建 `UserFavoritesPresenter`，
+所以早期 A/B 全是假阴性（连诊断日志都不打）。
+
+真正触发崩溃的路径（已固化到 `scripts/goto_favorites.sh`）：
+
+```
+首页 -> 底部栏「设置」(540,2598) -> 左侧「我 的」标签 -> 「收藏夹」
+     -> UserFavoritesFragment (k.e.v.j.f.f, 列表 id = slv_favorite_list)
+     -> initData() 发起同步 -> 原生回调 -> v0() -> 崩溃
+```
+
+## 12.6 A/B 对照（手机，可复现）
+
+对照组 `amap-nofix5.apk`（fix#1..#4 + 改包名，**不含 fix#5**，`classes8.dex`
+与修复前逐字节相同 `37ebb189…`）vs 修复组 `amap-splitfix-lite.apk`：
+
+| 判据 | 对照组（无 #5） | 修复组（含 #5） |
+|---|---|---|
+| 进程存活 | **否（闪退）** | **是** |
+| `CalledFromWrongThread` | **11** | **0** |
+| `HMI callback exception` | **10** | **0** |
+| `FATAL EXCEPTION` | **1** | **0** |
+| `slv_favorite_list` 页面 | — | **渲染成功** |
+
+复现脚本：
+
+```bash
+scripts/goto_favorites.sh                       # 导航到崩溃入口
+scripts/ab_favorites_crash.sh <apk> <label>     # 安装 + 触发 + 统计
+```
+
+## 12.7 已知取舍
+
+修复只把 `v0()` 的 UI 更新挪回主线程，**不改变同步逻辑、不改数据**。
+`TaskManager.post` 在主线程内联，所以主线程路径零额外开销（仅多一次 Runnable 分配）。

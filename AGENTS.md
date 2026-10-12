@@ -48,8 +48,8 @@
 | #1 `mcFixDisplay` | `getDisplay().getDisplayId() != 0` | 车机分屏 = 独立显示屏 |
 | #2 `NaviView.Dd` NPE | `isInMultiWindowMode() == true` | 同屏分屏（displayId 仍为 0） |
 | #3 `applyImmersive` | 无（每次 `onCreate` 都执行） | 界面默认全屏、状态栏/导航栏被隐藏 |
-
 | #4 包名冲突 | 车机已预装原装高德 | 安装报「与现有软件冲突」 |
+| #5 收藏夹线程 | 设置 → 我的 → 收藏夹 | 同步回调在原生线程碰 View → 闪退 |
 
 > 车机分屏**同时**满足 #1 与 #2，所以两个都必须修。手机上用 AOSP 同屏分屏可以单独复现 #2
 > （`displayId` 不变，因此 #1 不触发）。#3 与分屏无关，任何设备上都生效。
@@ -134,6 +134,39 @@ Can't install because provider name com.byd.naviauto.mapprovider
 
 不改 `0x1706` 为 `0x0`，是因为 `0x0` 仍会覆盖宿主可能自己设置的 UI 标志；整段不碰最安全。
 
+### 修复 #5：`UserFavoritesPresenter.v0()` 加主线程守卫
+
+只改 `classes8.dex`（`scripts/fix_UserFavorites.py`）：
+
+```smali
+    invoke-static {}, Landroid/os/Looper;->myLooper()Landroid/os/Looper;
+    move-result-object v0
+    invoke-static {}, Landroid/os/Looper;->getMainLooper()Landroid/os/Looper;
+    move-result-object v1
+    if-eq v0, v1, :cond_v0_main     # 已在主线程 -> 原逻辑；否则 post 后返回
+    new-instance v0, Lk/e/v/h/c/m;
+    invoke-direct {v0, p0}, Lk/e/v/h/c/m;-><init>(...UserFavoritesPresenter;)V
+    invoke-static {v0}, Lcom/autosdk/bussiness/common/task/TaskManager;->post(Ljava/lang/Runnable;)V
+    return-void
+    :cond_v0_main
+```
+
+同步 SDK 的原生线程池（`bl_thd_pool_worker`，字符串只存在于 `lib/arm64-v8a/libGComm3rd.so`）
+回调进来后同步执行到 `v0()` → `k.e.v.j.f.f.h2()` → `updateViewText()` → `TextView.setText()`，
+在主线程之外碰 View → `CalledFromWrongThreadException` → `HMI callback exception` → FATAL。
+`notify()` 里其余调用（`d2()`/`j2()` 走 `TaskManager.post`、`t0()`/`s0()`/`u0()` 走 RxJava
+`observeOn(mainThread)`、`X0()` 是 SharedPreferences 写入）**都已经是线程安全的**，`v0()` 是唯一裸的 UI 操作。
+
+> ⚠️ 必须 `if-eq`（相等才跳转）。用 `if-ne` 会反转判断：主线程调用 → post 分支 →
+> `TaskManager.post` 在主线程**内联执行** → 再次进 `v0()` → 无限递归 `StackOverflowError`（实测）。
+
+> ⚠️ **真实入口是「设置 → 我的 → 收藏夹」**（`scripts/goto_favorites.sh`），
+> 不是首页右上角的收藏图标——后者打开的是搜索模块收藏页（`slv_search_favorite`），
+> 不会创建 `UserFavoritesPresenter`，早期 A/B 因此全是假阴性。
+> 一键复现：`scripts/ab_favorites_crash.sh <apk> <label>`。
+
+**这是原包自带的老 bug**（对照组 `classes8.dex` 与修复前逐字节相同，同样必崩）。
+
 ### 修复 #4：改包名 + 改冲突 authority（为了和车机原装共存）
 
 见 §2.4。字符串口径为 **safe**：服务端上报值保持原样（`UserConstant.PACKAGE_NAME`、
@@ -144,14 +177,15 @@ Can't install because provider name com.byd.naviauto.mapprovider
 只替换 `classes.dex / classes5 / classes8 / classes9 / classes11 / classes13 /
 classes18 / classes21 / classes22 / classes25` 共 10 个 dex，其余 zip 条目逐字节不变，然后重新签名。
 
-- 补丁包（原名版）：`.work/out/amap-splitfix.apk`（三个修复都在）
+- 补丁包（原名版）：`.work/out/amap-splitfix.apk`（修复 #1–#3）
   SHA-256 `93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed`
-- **共存版（改包名，推荐装车）**：`.work/out/amap-splitfix-lite.apk`
-  SHA-256 `087ab9463af593fb5ab394896d7add0a5e002da43f8680753cd36feb6a771c10`
+- **共存版（改包名，推荐装车）**：`.work/out/amap-splitfix-lite.apk`（修复 #1–#5）
+  SHA-256 `6d19e40c8d098ea8e58ae9e9625c7b796f5cceb8beb71f0163ba303ed110ce49`
 - 对照组（只修 #1+#2，用于证明 #3）：`.work/out/amap-nofix3.apk`
   SHA-256 `e32177eec5076656497a02e967f8ad0e2ef58ee03cf8ebe2cedc25da93e9ee1d`
 - 对照组（只修 #1，用于证明 #2）：`.work/out/amap-mcfix-only-signed.apk`
   SHA-256 `01de14f7620df5f47bc17620a8993a1d5e701d1a136594b8031b44dc74813cf6`
+- 对照组（fix#1..#4 + 改名，无 #5，用于证明 #5）：`.work/out/amap-nofix5.apk`
 
 ## 4. 目录结构
 
@@ -168,12 +202,15 @@ classes18 / classes21 / classes22 / classes25` 共 10 个 dex，其余 zip 条�
 │   ├── fix_mcFixDisplay.py       # 修复 #1 的 smali 改写
 │   ├── fix_NaviView.py           # 修复 #2 的 smali 改写
 │   ├── fix_DpiScaleManager.py    # 修复 #3（强制全屏）的 smali 改写
+│   ├── fix_UserFavorites.py      # 修复 #5（收藏夹线程）smali 改写 + 新增 Runnable 类
 │   ├── fix_RenamePackage.py      # 修复 #4：dex 侧改包名 + 冲突 authority（含 KEEP 表）
 │   ├── rename_pkg_binary.py      # 修复 #4：二进制改 manifest / arsc 包名
 │   ├── build_apk.sh              # 改包名 + 替换 dex + zipalign + apksigner → 可安装 APK
 │   ├── capture.sh                # adb 无线配对 / 连接 / 抓崩溃日志
 │   ├── splitscreen.sh            # 分屏测试台（real 同屏分屏 / virt 虚拟屏 / exit / log）
 │   ├── repro_navi_npe.sh         # 一键复现根因 #2（真机真实分屏 + 导航）
+│   ├── goto_favorites.sh         # 导航到 #5 的真实崩溃入口（设置→我的→收藏夹）
+│   ├── ab_favorites_crash.sh     # 一键复现根因 #5 + A/B 统计
 │   ├── jxctl.sh / jxq.py         # JADX 常驻查询服务（快速 grep 反编译源码）
 │   └── dexstr.py                 # DEX 字符串提取
 ├── patches/
@@ -185,7 +222,9 @@ classes18 / classes21 / classes22 / classes25` 共 10 个 dex，其余 zip 条�
 │   ├── JadxServer.java           # JADX 常驻 TCP 查询服务
 │   └── Export.java               # JADX 全量源码导出
 └── .work/                        # 工作区（不入 git）
-    ├── out/amap-splitfix.apk     # 补丁产物（三个修复，原名）
+    ├── out/amap-splitfix.apk     # 补丁产物（修复 #1–#3，原名）
+    ├── out/amap-splitfix-lite.apk # 补丁产物（修复 #1–#5 + 改名，推荐装车）
+    ├── out/amap-nofix5.apk       # 对照组（修复 #1–#4 + 改名，无 #5）
     ├── out/amap-splitfix-lite.apk  # ★ 共存版（改包名，推荐装车）
     ├── out/amap-nofix3.apk       # 对照组（只修 #1+#2）
     ├── out/amap-mcfix-only-signed.apk  # 对照组（只修 #1）
