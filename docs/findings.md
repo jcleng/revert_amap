@@ -785,3 +785,176 @@ scripts/ab_favorites_crash.sh <apk> <label>     # 安装 + 触发 + 统计
 
 修复只把 `v0()` 的 UI 更新挪回主线程，**不改变同步逻辑、不改数据**。
 `TaskManager.post` 在主线程内联，所以主线程路径零额外开销（仅多一次 Runnable 分配）。
+
+---
+
+# 13. 修复六：底栏「充电站」按钮点击打开的是加油站（行为与标签不一致）
+
+## 13.1 现象
+
+修复六的第一阶段（`resources.arsc` 字符串替换）完成后，导航页底部栏按钮的文字已经是
+**「充电站」**（原为「加油站」），但**点下去仍然打开加油站搜索页**（筛选条是
+「优惠油站」，结果是「中国石化 / 中国石油 / 壳牌」）。用户诉求：
+
+> 「不对，显示`充电站`，点击也要是`充电站`才行」
+
+同时首页搜索页的分类入口也显示为「加油站」。
+
+## 13.2 排查：先把点击链路整条走通
+
+从布局到搜索关键字，逐跳确认（全部为静态可证 + 运行时确认）：
+
+```
+res/layout/fragment_auto_navi.xml:97-100
+  cl_navi_charging_station (SkinConstraintLayout)
+    ├─ sl_navi_charging_station  (SkinLottieAnimationView, src=@drawable/icon_layer_btn_charging_day)
+    └─ SkinTextView  android:text="@string/charge_station"   ← 无 resource-id
+              │
+              ▼  NaviView.smali:12555  sget cl_navi_charging_station
+                 NaviView.smali:12561  iput-object ... R4
+                 NaviView.smali:6689   iget-object ... R4
+                 NaviView.smali:3454   R4.setOnClickListener
+              ▼
+NaviView.java:1380   ((d7) f10189d).onStartAlongWaySearch(1, p3.a())
+              ▼
+RouteResultMapPresenter.java:3975
+   onStartAlongWaySearch(int i2, String str)
+       -> onStartAlongWaySearch(1, o2.c(i2, null), null, false)
+          # 传入的 p3.a() 被丢弃；第一个实参硬编码为 1
+              ▼
+k/e/d/q0/o2.java  c(1, null) == f(1, null, ...)  → 返回 ""（空关键字）
+              ▼
+j2.H4(1, "", null)   (j2.java:1086)
+       -> new DriveAlongSearchCardViewR(..., C4 = 1, y4 = "", x4 = null, ...)
+              ▼
+DriveAlongSearchCardViewR.J()   (doSearch, line 1652)
+
+    if (TextUtils.isEmpty(this.y4) && this.C4 != 3) {
+        this.C4 = 2;
+        this.y4 = CarUtils.isNewEnergyVehicle() ? "充电站" : "加油站";   // ← 真正的分叉点
+    }
+              ▼
+    G1() -> DriveAlongSearchCardPresenterR.doEnSearch(C4, y4, ...)
+```
+
+**结论：图标本身是充电枪闪电（`icon_layer_btn_charging_day.xml`，`#ff9f19`），
+英文资源是 `"Charge"`，整条链路都指向充电站——唯一把结果掰成加油站的是
+`CarUtils.isNewEnergyVehicle()` 返回了 `false`。**
+
+## 13.3 根因：`CarUtils.getPowerType()` 的 `-1` 回退方向写反了
+
+`classes21.dex` 里 `com.autosdk.bussiness.user.utils.CarUtils`：
+
+```java
+public static int getPowerType() {
+    ILoginCarData d = iLoginCarData;
+    if (d == null) return 1;                 // 「还不知道」→ 电车
+    if (d.getPowerType() == -1) return 0;    // 「读不到」  → 油车   ← BUG
+    return iLoginCarData.getPowerType();
+}
+```
+
+* `iLoginCarData` 的实现是 `k.e.d.q0.b2`，其 `getPowerType()` 转发给
+  `PlatformUtils.getInstance().getPowerType()`（同在 `classes21.dex`）。
+* `PlatformUtils.getPowerType()` 读取 BYD 车机属性 `"power_type"`
+  （`VehicleInfoConstant.PLATFORM_PROPERTY` 同族机制）。**读不到时返回 `-1`**
+  （`POWER_TYPE_INVALID`）。
+* `PlatformUtils.getPowerType()` 里本来有一个 `-1 → 1`（电车）的兜底，但**只在
+  `isTargetProject(app, "kd")` 成立时生效**；本包 manifest 的 `PRODUCT = "l5"`，
+  所以兜底永不触发，值一路保持 `-1`。
+
+于是在这台车机上（第三方重签名包，BYD 车服务拒绝读属性），**整个 App 降级为「油车」**：
+
+| 位置 | 受影响的分支 |
+|---|---|
+| `DriveAlongSearchCardViewR.J()` | 关键字 `isNewEnergyVehicle() ? "充电站" : "加油站"` |
+| `SearchExtraServiceInitInfo` | 首页分类宫格 `getGas()` 而非 `getCharging()` |
+| `k/e/g/k2/d/p3.c()` | 沿途品牌条：油站品牌而非充电品牌 |
+| `MainMapView` | `searchAroundByKey("加油站")` |
+| `RouteRequestController` | 能耗模型 / 继续充电规划 |
+| `com.autosdk.drive.widget.MapWidgetUtil` | `getChargeDrawableID` 等 5 处 `R$string.charge_station` |
+
+**运行时确认**（`logcat`，`E D/SendCacheTool`）：
+
+```
+[main][needSend.PlatformUtils.getPowerType] value = -1, cache = (-1, 116570271), ret = false
+```
+
+`value = -1` 恒定出现，确认车机属性读不到。
+
+> 这是**原包自带的老 bug**，不是补丁引入的，也不是分屏导致的。
+> 两个分支自相矛盾：`iLoginCarData == null`（「还不知道」）被当成电车，
+> 而 `-1`（「明确读不到」）被当成油车。「读不到车型」的保守解释不应该是「油车」。
+
+## 13.4 修复
+
+`scripts/fix_CarUtilsPowerType.py`：把 `-1` 回退分支的返回值由 `0`（油车）
+改为 `1`（电车），与 `d == null` 分支保持一致。
+
+```smali
+    if-ne v0, v1, :cond_1
+    const/4 v0, 0x0     ->  const/4 v0, 0x1
+```
+
+正则锚定整个 `getPowerType()` 方法体（含 `.locals 2` 与 `sget-object … iLoginCarData`），
+避免误命中文件里其它相同的 `const/4 v0, 0x0`。
+
+**范围说明**：这个改法面向**纯电车**。若车是油车，`-1` 回退应保持 `0`
+（更好的做法是做成用户可选项）。本仓库按用户确认的车型（纯电）落地。
+
+## 13.5 修复六的两个组成部分
+
+| 阶段 | 脚本 | 改动 | 效果 |
+|---|---|---|---|
+| 6a 标签 | `scripts/fix_ChargeStationStrings.py` | 改 `resources.arsc`：26 个 charge 族字符串（53 处 entry 重指向） | 底栏/首页/沿途 文字变为「充电站」 |
+| 6b 行为 | `scripts/fix_CarUtilsPowerType.py` | 改 `classes21.dex`：`getPowerType()` `-1` 回退 `0 → 1` | 点击打开充电站搜索页；首页分类、沿途品牌条同步 |
+
+两者**必须同时存在**，否则会出现「字是充电站、点了是加油站」或反之的不一致。
+
+## 13.6 运行时验证（手机，可复现）
+
+设备：Redmi（Android 16）。虽然它不是 BYD 车机，但 `PlatformUtils.getPowerType()`
+在这台手机上**同样返回 `-1`**（`logcat` 已确认），所以修复**可以在这台手机上完整验证**。
+
+导航页底栏 `cl_navi_charging_station` 中心坐标 `(744,1082)`（横屏 2712×1220）。
+
+| 判据 | 修复前（仅 6a） | 修复后（6a + 6b） |
+|---|---|---|
+| 底栏按钮文字 | 充电站 | 充电站 |
+| 点击后筛选条 | **优惠油站** | **快充 / 超充** |
+| 点击后结果 | **中国石化 / 中国石油 / 壳牌** | **小朗充电汽车充电站 / 蔚景云汽车充电站** |
+| 点击后价格单位 | 元/升 | **元/度** |
+| 首页搜索分类 | **加油站** | **充电站** |
+| `FATAL EXCEPTION` | 0 | 0 |
+
+点击后的页面文本（`uiautomator dump` 摘录）：
+
+```
+充电站
+终点附近   快充   附近500米   超充
+1  小朗充电汽车充电站(小朗充电-兰花丽景二期充电站)
+   214米 · 石桥铺街道,石新路兰花丽景二期负一层275
+2  蔚景云汽车充电站(雷鳗兰花丽景二期地下停车场B1层227号车位充电站)
+   0.66 元/度
+```
+
+**严格 A/B 对照**：用同一套构建流程，只把 `classes21.dex` 换回未修版本
+（`const/4 v0, 0x0`）生成对照包 `amap-ctl-carutils.apk`：
+
+| 包 | SHA-256 | 说明 |
+|---|---|---|
+| `amap-ctl-carutils.apk` | `361b64b00aa10b021fd6bc8ebd3540c89fef14836e397a3a35e840c0d31b854a` | 仅 6a（标签），点击仍为加油站 |
+| `amap-splitfix-lite.apk` | `f1d17de2ca1576112151c59c9de3fdd9478306c6ab13c7b05cedc07d162a293f` | 6a + 6b（标签 + 行为） |
+
+对照包的 SHA 与**修复 6b 之前的构建逐字节相同**（`361b64b0…`），证明两个包之间的差异
+**只有 `CarUtils.getPowerType()` 里的那一个 `const/4`**。
+
+## 13.7 已知取舍
+
+* 该修复把「读不到车型」一律当作**电车**。若把此包装到油车上，会出现「显示充电站、
+  实际要找加油站」的反向不一致。更好的长期方案是把车型做成设置项，而不是编译期常量。
+* 手机验证的是**关键字分叉**（`isNewEnergyVehicle()`），车机上还有
+  `PlatformUtils.getPowerType()` 的其它直接消费者（见 13.3 表格），它们会一并转为电车路径——
+  与纯电车型一致。
+* `-1` 这个值本身在车机上代表「属性不可读」，不排除在**真正的 BYD 车机**上
+  `power_type` 可正常读取（返回 1/2），那样 `-1` 分支根本不会走到，本修复为无害冗余。

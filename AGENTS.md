@@ -11,7 +11,7 @@
 - 版本：`V3.15.872.11.910.1.202608311746.2`（versionCode 872，minSdk 24，targetSdk 30）
 - 原包 SHA-256：`450a1848ec6ecbda9a981598b9338f58784dcd6951a81d7ec8a8e198f10bf285`
 
-## 2. 根因（三个，互相独立）
+## 2. 根因（六个，互相独立）
 
 原包是**第三方重打包**版本，注入了 `com.byd.automap.activity.MainActivity.mcFixDisplay()`。
 该方法在 `getDisplay().getDisplayId() != 0`（车机分屏 / 副屏的**正常**状态）时会：
@@ -50,9 +50,11 @@
 | #3 `applyImmersive` | 无（每次 `onCreate` 都执行） | 界面默认全屏、状态栏/导航栏被隐藏 |
 | #4 包名冲突 | 车机已预装原装高德 | 安装报「与现有软件冲突」 |
 | #5 收藏夹线程 | 设置 → 我的 → 收藏夹 | 同步回调在原生线程碰 View → 闪退 |
+| #6 车型判定 | 车机读不到 `power_type`（返回 -1） | 底栏「充电站」点了却搜加油站；首页分类也是加油站 |
 
 > 车机分屏**同时**满足 #1 与 #2，所以两个都必须修。手机上用 AOSP 同屏分屏可以单独复现 #2
 > （`displayId` 不变，因此 #1 不触发）。#3 与分屏无关，任何设备上都生效。
+> #5、#6 也是**原包自带的老 bug**，与分屏无关。
 
 ### 2.4 第四个问题：装不上车机 → 改包名
 
@@ -167,6 +169,35 @@ Can't install because provider name com.byd.naviauto.mapprovider
 
 **这是原包自带的老 bug**（对照组 `classes8.dex` 与修复前逐字节相同，同样必崩）。
 
+### 修复 #6：车型判定 + 「充电站」字符串（`resources.arsc` + `classes21.dex`）
+
+底栏按钮显示「充电站」但点下去打开加油站搜索页。分两步：
+
+**6a 标签** —— `scripts/fix_ChargeStationStrings.py`：
+`resources.arsc` 里 26 个 charge 族字符串（`charge_station`、`drive_charge_station`、
+`route_result_charge_station`、`search_home_charge_station`、`tts_electric_warning_tips` 等）
+被系统性误译成「加油站」。做法是**在全局字符串池尾部追加新串、只重指向受影响的 entry**
+（保留原有索引），不动 `gas_station`（它与 `charge_station` 共享池条目 14042）。
+结果：53 处 entry 重指向，池 24519→24539，arsc 7130988→7131792 字节。
+
+**6b 行为** —— `scripts/fix_CarUtilsPowerType.py`：
+`CarUtils.getPowerType()`（`classes21.dex`）把「读不到车型」（`-1`）回退成**油车**，
+与 `iLoginCarData == null` 回退成**电车**自相矛盾：
+
+```java
+if (d == null) return 1;                 // 「还不知道」→ 电车
+if (d.getPowerType() == -1) return 0;    // 「读不到」  → 油车   ← BUG
+```
+
+车机读不到 BYD 属性 `power_type` 时恒为 `-1`（`logcat`：
+`needSend.PlatformUtils.getPowerType] value = -1`），于是整个 App 降级为油车。
+修复：`const/4 v0, 0x0` → `const/4 v0, 0x1`（正则锚定整个方法体）。
+
+> ⚠️ 两个阶段**必须同时存在**，否则出现「字是充电站、点了是加油站」的不一致。
+> ⚠️ 该修复面向**纯电车**。油车应保持 `0`（更好的做法是做成设置项）。
+
+**这是原包自带的老 bug**，与分屏无关。
+
 ### 修复 #4：改包名 + 改冲突 authority（为了和车机原装共存）
 
 见 §2.4。字符串口径为 **safe**：服务端上报值保持原样（`UserConstant.PACKAGE_NAME`、
@@ -179,13 +210,18 @@ classes18 / classes21 / classes22 / classes25` 共 10 个 dex，其余 zip 条�
 
 - 补丁包（原名版）：`.work/out/amap-splitfix.apk`（修复 #1–#3）
   SHA-256 `93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed`
-- **共存版（改包名，推荐装车）**：`.work/out/amap-splitfix-lite.apk`（修复 #1–#5）
-  SHA-256 `6d19e40c8d098ea8e58ae9e9625c7b796f5cceb8beb71f0163ba303ed110ce49`
+- **共存版（改包名，推荐装车）**：`.work/out/amap-splitfix-lite.apk`（修复 #1–#6）
+  SHA-256 `f1d17de2ca1576112151c59c9de3fdd9478306c6ab13c7b05cedc07d162a293f`
+- 对照组（fix#1..#4 + 改名 + 6a 标签，无 #5/#6b，用于证明 #5 与 #6b）：
+  `.work/out/amap-nofix5.apk`
+- 对照组（fix#1..#6a + 改名，`classes21.dex` 回退为原版，用于证明 #6b）：
+  `.work/out/amap-ctl-carutils.apk`
+  SHA-256 `361b64b00aa10b021fd6bc8ebd3540c89fef14836e397a3a35e840c0d31b854a`
+  （与修复 6b 之前的构建逐字节相同）
 - 对照组（只修 #1+#2，用于证明 #3）：`.work/out/amap-nofix3.apk`
   SHA-256 `e32177eec5076656497a02e967f8ad0e2ef58ee03cf8ebe2cedc25da93e9ee1d`
 - 对照组（只修 #1，用于证明 #2）：`.work/out/amap-mcfix-only-signed.apk`
   SHA-256 `01de14f7620df5f47bc17620a8993a1d5e701d1a136594b8031b44dc74813cf6`
-- 对照组（fix#1..#4 + 改名，无 #5，用于证明 #5）：`.work/out/amap-nofix5.apk`
 
 ## 4. 目录结构
 
@@ -203,6 +239,8 @@ classes18 / classes21 / classes22 / classes25` 共 10 个 dex，其余 zip 条�
 │   ├── fix_NaviView.py           # 修复 #2 的 smali 改写
 │   ├── fix_DpiScaleManager.py    # 修复 #3（强制全屏）的 smali 改写
 │   ├── fix_UserFavorites.py      # 修复 #5（收藏夹线程）smali 改写 + 新增 Runnable 类
+│   ├── fix_ChargeStationStrings.py # 修复 #6a：arsc 字符串（加油站 → 充电站）
+│   ├── fix_CarUtilsPowerType.py  # 修复 #6b：读不到车型时回退为电车
 │   ├── fix_RenamePackage.py      # 修复 #4：dex 侧改包名 + 冲突 authority（含 KEEP 表）
 │   ├── rename_pkg_binary.py      # 修复 #4：二进制改 manifest / arsc 包名
 │   ├── build_apk.sh              # 改包名 + 替换 dex + zipalign + apksigner → 可安装 APK
@@ -272,15 +310,19 @@ bash scripts/build_patch.sh
 bash scripts/build_apk.sh
 ```
 
-`build_patch.sh` 会：先对 `classes9/22/25` 跑三个代码修复得到 `*_patched.dex`，
-再对全部 10 个 dex 跑 `fix_RenamePackage.py` 得到 `*_pkg.dex`。
+`build_patch.sh` 会：先对 `classes9/22/25/8/21` 跑代码修复（`fix_mcFixDisplay.py` #1、
+`fix_NaviView.py` #2、`fix_DpiScaleManager.py` #3、`fix_UserFavorites.py` #5、
+`fix_CarUtilsPowerType.py` #6b）得到 `*_patched.dex`，再对全部 10 个 dex 跑
+`fix_RenamePackage.py` 得到 `*_pkg.dex`。
 
 `build_apk.sh` 会：
-1. 用 `rename_pkg_binary.py` 就地改 `AndroidManifest.xml` 与 `resources.arsc`
+1. `patch_arsc()` 用 `fix_ChargeStationStrings.py` 在 `resources.arsc` 里追加充电站系列字符串
+   只重指向受影响 entry（#6a）；
+2. 用 `rename_pkg_binary.py` 就地改 `AndroidManifest.xml` 与 `resources.arsc`
    （包名 + 两个冲突 authority）；
-2. 逐条复制原 zip，跳过 `META-INF/*.SF|*.RSA|*.DSA|*.EC|MANIFEST.MF`，把 10 个 dex 换成 `*_pkg.dex`；
-3. `zipalign -f -p 4`；
-4. `apksigner sign`（v1+v2+v3，keystore `.work/keystore/amapfix2.jks`，口令 `amapfix2`）。
+3. 逐条复制原 zip，跳过 `META-INF/*.SF|*.RSA|*.DSA|*.EC|MANIFEST.MF`，把 10 个 dex 换成 `*_pkg.dex`；
+4. `zipalign -f -p 4`；
+5. `apksigner sign`（v1+v2+v3，keystore `.work/keystore/amapfix2.jks`，口令 `amapfix2`）。
 
 产物：`.work/out/amap-splitfix-lite.apk`（包名 `com.autonavi.amapautolite`）。
 
@@ -379,6 +421,8 @@ bash scripts/repro_navi_npe.sh .work/out/amap-splitfix.apk
 ## 9. 待办
 
 - [ ] 在真车机上抓一次分屏闪退日志（需车机 adb 权限）以最终闭环。
+- [ ] 实测真实 BYD 车机的 `power_type` 属性是否可读（返回 1/2 时 #6b 为无害冗余）。
+- [ ] 若需支持油车，把 #6b 的车型回退改成用户可选项，而不是编译期常量。
 - [ ] 确认车机是否存在按原签名指纹校验此 App 的模块。
 - [ ] 实测真实 BYD 车机的 `ro.vehicle.type` / `isPlatformUI()`，确认车机是否会踩 #2。
 - [ ] 若需保留"非分屏场景纠正显示"的行为，可改为 `if (isInMultiWindowMode()) return false;` 而非完全 no-op。

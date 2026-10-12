@@ -1,6 +1,8 @@
 #!/bin/bash
 # Build the installable patched APK.
 #
+#   * repair the systematically mistranslated charging (充电) string family in
+#     resources.arsc -- see scripts/fix_ChargeStationStrings.py (fix #6)
 #   * rename the application package  com.autonavi.amapauto -> com.autonavi.amapautolite
 #     in AndroidManifest.xml + resources.arsc (binary, in place, see
 #     scripts/rename_pkg_binary.py) and in the dex files (scripts/fix_RenamePackage.py)
@@ -63,10 +65,18 @@ dexes = rest
 # --- 1. binary rename of AndroidManifest.xml + resources.arsc -----------------
 sys.path.insert(0, '/home/jcleng/work/mywork/revert_amap/scripts')
 from rename_pkg_binary import replace_manifest, replace_arsc
+from fix_ChargeStationStrings import patch_arsc
 
 zin = zipfile.ZipFile(src)
 mf = zin.read('AndroidManifest.xml')
 ar = zin.read('resources.arsc')
+
+# --- 0. fix #6: repair the mistranslated 充电 (charging) string family ----------
+ar, cs_n = patch_arsc(ar, verbose=False)
+print('[0] arsc string fix: %d charge-family entries repointed, %d -> %d bytes'
+      % (cs_n, len(zin.read('resources.arsc')), len(ar)))
+
+# --- 1. binary rename of AndroidManifest.xml + resources.arsc -----------------
 mf2, mf_n, mf_total = replace_manifest(mf, pairs)
 ar2, pkg_n, pool_n = replace_arsc(ar, pairs)
 assert mf_n > 0 and pkg_n > 0, 'package rename did not apply'
@@ -112,5 +122,9 @@ zipalign -c -p 4 "$FINALAPK" && echo "[4] zipalign OK"
 AAPT=/home/jcleng/work/mywork/zhongjian-liquor-web/node_modules/aaptjs/bin/linux/aapt
 echo "[5] badging:"
 "$AAPT" d badging "$FINALAPK" 2>/dev/null | grep -E "^package|^launchable-activity" | head -3
+echo "[6] fix #6 spot-check (charge_station must be 充电站, gas_station 加油站):"
+"$AAPT" dump --values resources "$FINALAPK" 2>/dev/null \
+  | awk '/string\/(charge_station|gas_station): t=/{n=$2; next} n!=""&&/string8/{gsub(/^ +/,""); print "    "n" = "$0; n=""}' \
+  | sort -u
 ls -la "$FINALAPK"
 sha256sum "$FINALAPK"

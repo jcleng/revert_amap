@@ -40,7 +40,16 @@
 #      head unit as "与现有软件冲突").  Renaming the package lets it coexist as a
 #      separate app.  See scripts/fix_RenamePackage.py for the KEEP list.
 #
-# Outputs .work/patch/classes{8,9,22,25}_patched.dex and, for the renamed dexes,
+#  [6] classes21.dex -> CarUtils.getPowerType()
+#      getPowerType() returns 1 (EV) when iLoginCarData is null but 0 (petrol)
+#      when the car property is POWER_TYPE_INVALID (-1).  On the head unit the
+#      "power_type" property is unreadable, so the whole app degraded to a petrol
+#      car: the along-way search keyword became "加油站", the home category grid
+#      showed petrol, and the nav bottom-bar "充电站" button opened a petrol page.
+#      Patch: make the -1 fallback return 1 (EV), matching the null branch.
+#      See scripts/fix_CarUtilsPowerType.py and docs/findings.md §13.
+#
+# Outputs .work/patch/classes{8,9,21,22,25}_patched.dex and, for the renamed dexes,
 # .work/patch/classes{0,5,8,9,11,13,18,21,22,25}_pkg.dex
 set -euo pipefail
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
@@ -50,6 +59,7 @@ BASE=/home/jcleng/work/mywork/revert_amap/.work
 W=$BASE/patch
 SRC8=$BASE/dex8/classes8.dex
 SRC9=$BASE/dex9/classes9.dex
+SRC21=$BASE/dex21/classes21.dex
 SRC22=$BASE/dex22/classes22.dex
 SRC25=$BASE/dex25/classes25.dex
 RENAME_FIXER=/home/jcleng/work/mywork/revert_amap/scripts/fix_RenamePackage.py
@@ -109,10 +119,11 @@ PY
   cd "$W"
 }
 
-patch_one "$SRC8"  classes8  /home/jcleng/work/mywork/revert_amap/scripts/fix_UserFavorites.py   5
-patch_one "$SRC9"  classes9  /home/jcleng/work/mywork/revert_amap/scripts/fix_mcFixDisplay.py     1
-patch_one "$SRC22" classes22 /home/jcleng/work/mywork/revert_amap/scripts/fix_NaviView.py         2
-patch_one "$SRC25" classes25 /home/jcleng/work/mywork/revert_amap/scripts/fix_DpiScaleManager.py 3
+patch_one "$SRC8"  classes8  /home/jcleng/work/mywork/revert_amap/scripts/fix_UserFavorites.py       5
+patch_one "$SRC9"  classes9  /home/jcleng/work/mywork/revert_amap/scripts/fix_mcFixDisplay.py       1
+patch_one "$SRC21" classes21 /home/jcleng/work/mywork/revert_amap/scripts/fix_CarUtilsPowerType.py 6
+patch_one "$SRC22" classes22 /home/jcleng/work/mywork/revert_amap/scripts/fix_NaviView.py           2
+patch_one "$SRC25" classes25 /home/jcleng/work/mywork/revert_amap/scripts/fix_DpiScaleManager.py   3
 
 # Package rename.  Applied to the *patched* output for the three dexes that carry a
 # code fix, and straight from the original for the rest, so every dex is touched once.
@@ -123,6 +134,7 @@ for spec in "0:classes" "5:classes5" "8:classes8" "9:classes9" "11:classes11" \
   case "$name" in
     classes8)  src="$W/classes8_patched.dex" ;;
     classes9)  src="$W/classes9_patched.dex" ;;
+    classes21) src="$W/classes21_patched.dex";;
     classes22) src="$W/classes22_patched.dex";;
     classes25) src="$W/classes25_patched.dex";;
     *)         src="$W/${name}_orig.dex"

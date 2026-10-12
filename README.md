@@ -15,10 +15,11 @@
 | **根因 3** | 第三方注入的 `DpiScaleManager.applyImmersive()` 强制沉浸式全屏，隐藏状态栏+导航栏（`classes25.dex`） |
 | **根因 4** | 预装同包名应用签名不同 → `INSTALL_FAILED_UPDATE_INCOMPATIBLE`（车机显示「与现有软件冲突」） |
 | **根因 5** | `UserFavoritesPresenter.v0()` 在原生线程上直接 `TextView.setText()` → `CalledFromWrongThreadException`（`classes8.dex`，**原包自带老 bug**） |
-| **修复** | #1 短路为 `return false`；#2 加判空；#3 跳过整段 window 操作；#5 给 `v0()` 加主线程守卫；#4 改包名共存。只改 4 个 dex 并重签 |
-| 补丁包 SHA-256 | `93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed`（原名）<br>`6d19e40c8d098ea8e58ae9e9625c7b796f5cceb8beb71f0163ba303ed110ce49`（改包名版 `amap-splitfix-lite.apk`，含修复 #1–#5） |
+| **根因 6** | `CarUtils.getPowerType()` 的 `-1`（读不到车型）回退成**油车** → 底栏「充电站」按钮点击却打开加油站搜索（`classes21.dex`，**原包自带老 bug**） |
+| **修复** | #1 短路为 `return false`；#2 加判空；#3 跳过整段 window 操作；#5 给 `v0()` 加主线程守卫；#6 改 arsc 字符串 + `-1` 回退为电车；#4 改包名共存。只改 5 个 dex + `resources.arsc` 并重签 |
+| 补丁包 SHA-256 | `f1d17de2ca1576112151c59c9de3fdd9478306c6ab13c7b05cedc07d162a293f`（`amap-splitfix-lite.apk`，含修复 #1–#6） |
 
-五个 bug 的触发条件不同，**车机上分屏会同时踩到 #1 和 #2**，#3 则与分屏无关、每次启动都生效：
+六个 bug 的触发条件不同，**车机上分屏会同时踩到 #1 和 #2**，#3 则与分屏无关、每次启动都生效：
 
 | | 触发条件 | 场景 |
 |---|---|---|
@@ -27,6 +28,7 @@
 | #3 `applyImmersive` | 无（每次 `onCreate` 都执行） | 界面默认全屏、状态栏/导航栏被隐藏 |
 | #4 包名冲突 | 车机已装原装高德 | 安装报「与现有软件冲突」，装不上 |
 | #5 收藏夹线程 | 设置 → 我的 → 收藏夹 | 同步回调从原生线程更新 UI → 闪退 |
+| #6 车型判定 | 车机读不到 `power_type` 属性（返回 -1） | 底栏「充电站」点了却搜加油站；首页分类也是加油站 |
 
 ## 问题是什么
 
@@ -246,6 +248,49 @@ vs 修复组 `amap-splitfix.apk`（`93f8831b…`）：
 
 详见 [`docs/findings.md`](docs/findings.md) 第 12 节。
 
+## 第六个根因的验证（底栏「充电站」点击行为，A/B 对照）
+
+底栏按钮文字改成「充电站」后，**点下去仍然打开加油站搜索页**。链路是：
+`cl_navi_charging_station` → `onStartAlongWaySearch(1, "")` →
+`DriveAlongSearchCardViewR.J()`：
+
+```java
+this.y4 = CarUtils.isNewEnergyVehicle() ? "充电站" : "加油站";
+```
+
+而 `CarUtils.getPowerType()`（`classes21.dex`）把「读不到车型」（`-1`）
+回退成了**油车**，与 `iLoginCarData == null` 时回退成**电车**自相矛盾：
+
+```java
+if (d == null) return 1;                 // 「还不知道」→ 电车
+if (d.getPowerType() == -1) return 0;    // 「读不到」  → 油车   ← BUG
+```
+
+车机读不到 BYD 属性 `power_type` 时恒为 `-1`（`logcat`：
+`needSend.PlatformUtils.getPowerType] value = -1`），于是**整个 App 降级为油车**：
+底栏点击搜加油站、首页分类是加油站、沿途品牌条是油站品牌。
+
+修复（`scripts/fix_CarUtilsPowerType.py`）：`-1` 回退由 `0` 改为 `1`。
+配合 arsc 字符串修复（`scripts/fix_ChargeStationStrings.py`），
+标签与行为一致。
+
+同一台手机（`PlatformUtils.getPowerType()` 同样返回 `-1`，所以可完整验证）：
+
+| 判据 | 修复前（仅改标签） | 修复后（标签 + 行为） |
+|---|---|---|
+| 底栏按钮文字 | 充电站 | 充电站 |
+| 点击后筛选条 | **优惠油站** | **快充 / 超充** |
+| 点击后结果 | **中国石化 / 中国石油 / 壳牌** | **小朗充电汽车充电站 / 蔚景云汽车充电站** |
+| 点击后价格单位 | 元/升 | **元/度** |
+| 首页搜索分类 | **加油站** | **充电站** |
+| `FATAL EXCEPTION` | 0 | 0 |
+
+严格 A/B：同一构建流程，只把 `classes21.dex` 换回未修版（`const/4 v0, 0x0`）
+生成对照包，其 SHA 与修复 6b 之前的构建**逐字节相同**（`361b64b0…`），
+证明差异只有那一个 `const/4`。
+
+详见 [`docs/findings.md`](docs/findings.md) 第 13 节。
+
 ## 使用方法
 
 装到**已预装高德**的车机上（要共存）用改包名版：
@@ -279,14 +324,16 @@ AIDL token 必须跟着改）见 [`docs/findings.md`](docs/findings.md) 第 11 �
 ```
 docs/findings.md         完整逆向结论 + 运行时验证（主文档）
 docs/static-findings.md  静态分析速记
-scripts/build_patch.sh   dex 打补丁（五个修复）
+scripts/build_patch.sh   dex 打补丁（5 个代码修复）
 scripts/fix_mcFixDisplay.py   修复 #1 的 smali 改写
 scripts/fix_NaviView.py       修复 #2 的 smali 改写
 scripts/fix_DpiScaleManager.py 修复 #3（强制全屏）的 smali 改写
 scripts/fix_UserFavorites.py  修复 #5（收藏夹线程）的 smali 改写 + 新增 Runnable 类
+scripts/fix_ChargeStationStrings.py 修复 #6a（arsc 字符串）
+scripts/fix_CarUtilsPowerType.py  修复 #6b（车型判定）
 scripts/fix_RenamePackage.py   dex 侧改包名（类型描述符 + 选择性字符串 + 目录搬迁）
 scripts/rename_pkg_binary.py   二进制改 AndroidManifest.xml / resources.arsc 的包名
-scripts/build_apk.sh     改包名 + 打包 + 重签
+scripts/build_apk.sh     改包名 + 打包 + 重签（含 #6a arsc 修复）
 scripts/capture.sh       adb 无线配对 / 抓崩溃日志
 scripts/splitscreen.sh   分屏测试台（real 同屏分屏 / virt 虚拟屏）
 scripts/repro_navi_npe.sh 一键复现 #2（真机真实分屏）
