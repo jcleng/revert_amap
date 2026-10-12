@@ -40,7 +40,7 @@ run)
   done
   $ADB shell dumpsys dropbox --print 2>/dev/null | tail -400 > "$OUT/dropbox.txt"
   # app-specific
-  $ADB shell pidof com.autonavi.amapauto 2>&1
+  $ADB shell pidof ${PKG:-com.autonavi.amapautolite} 2>&1
   echo "### 结果"
   echo "-- crash.log --";            tail -60 "$OUT/crash.log"
   echo "-- crash_markers.txt --";    cat "$OUT/crash_markers.txt"

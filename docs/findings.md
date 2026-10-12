@@ -517,3 +517,129 @@ mInSplitScreen=true   9
 isInMultiWindowMode:true  1
 type=statusBars visible=true   ← 分屏导航中状态栏依然可见
 ```
+
+---
+
+# 11. 第四个问题：装不上车机（「与现有软件冲突」）→ 改包名
+
+## 11.1 现象
+
+车机（比亚迪 DiLink）上安装重打包的 APK 时，安装器报「与现有软件冲突」，
+安装失败。手机侧 `adb install` 能复现底层错误码。
+
+## 11.2 先排除一个常见的误判
+
+用户最初的想法是「改成高德公开车机版的包名」。**这条路是死路**：
+实测下载官网两个公开车机版，包名与当前重打包完全相同。
+
+| 来源 | 文件 | 包名 | versionCode |
+|---|---|---|---|
+| 官网老版 | `guanwangV1.9.0.2080.apk` (33,264,452 B) | `com.autonavi.amapauto` | 546 |
+| 官网最新 V950 | `Auto_9.5.0.600013_release_signed.apk` (154,947,836 B) | `com.autonavi.amapauto` | 26000001 |
+| 本仓库重打包 | `高德车机版车道级导航版.原包.apk` | `com.autonavi.amapauto` | 872 |
+
+三个包名完全一致 ⇒ 「改成公开车机版包名」是个空操作，解决不了冲突。
+**必须换一个真正不同的包名。**
+
+## 11.3 真正的冲突原因（实测错误码）
+
+在已装 `com.autonavi.amapauto` 的手机上装改名后的包，`adb install` 给出：
+
+```
+INSTALL_FAILED_CONFLICTING_PROVIDER: Scanning Failed.:
+Can't install because provider name com.byd.naviauto.mapprovider
+(in package com.autonavi.amapautolite) is already used by com.autonavi.amapauto
+```
+
+所以冲突不只是「签名不同」，还有 **ContentProvider authority 撞车**。
+车机上的原装应用和我们的包会同时声明这些 authority，Android 直接拒绝安装。
+
+排查出**两个不由包名派生**的 authority：
+
+| authority | 声明它的 Provider | 权限 |
+|---|---|---|
+| `com.byd.naviauto.mapprovider` | `com.autosdk.drive.magspace.MagSpaceContentProvider` | `...mapprovider.permission.READ_NAVI_DATA` |
+| `com.byd.automap.fenceprovider` | `com.autosdk.bussiness.geofence.FenceContentProvider` | `...fenceprovider.permission.ACCESS_FENCE_DATA` |
+
+其余 authority（`ExternalProvider` / `fx.provider` / `utilcode.provider` /
+`androidx-startup`）都从包名派生，改包名时自动跟着变，不会冲突。
+
+## 11.4 改包名的完整改动面
+
+包名 `com.autonavi.amapauto` → `com.autonavi.amapautolite`，同时改这两个 authority。
+
+| 位置 | 改法 | 脚本 |
+|---|---|---|
+| `AndroidManifest.xml`（二进制） | 重建字符串池，14→18 条字符串 | `scripts/rename_pkg_binary.py` |
+| `resources.arsc`（二进制） | 包名 256 字节字段 | 同上 |
+| dex 类型描述符 `Lcom/autonavi/amapauto/` | 无条件全改（13 个类 + 引用） | `scripts/fix_RenamePackage.py` |
+| dex 字符串字面量 | 选择性改，见 §11.5 | 同上 |
+| 两个 authority 及其权限名 | 全改 | 同上（`EXTRA` 表） |
+
+> **坑 1**：新包名 `com.autonavi.amapautolite` 以旧包名 `com.autonavi.amapauto`
+> 为前缀，直接用 `str.replace` 会把上一次的结果再替换一次，产出
+> `com.autonavi.amapautolitelite`。两个脚本都用负向断言
+> `com\.autonavi\.amapauto(?!lite)` 锚定。
+>
+> **坑 2**：authority 除了出现在 `const-string` 指令里，还会以字段初始化器的
+> 形式出现：`.field public static final AUTHORITY:Ljava/lang/String; = "..."`。
+> 正则要同时覆盖这两种写法，否则会漏掉
+> `FenceContentProvider.AUTHORITY`。
+
+## 11.5 「safe」口径：哪些字符串不改
+
+按用户选定的保守口径，**保持原样**（这些值是上报给高德/比亚迪服务端的身份标识）：
+
+- `UserConstant.PACKAGE_NAME`、`BydAccountReceiver.PACKAGE_NAME`（账号绑定 / 云端接口参数）
+- `BydAccountReceiver$CallBackNotify`、`BydAccountReceiver` 的
+  `lambda$onReceive$0` / `lambda$onReceive$1` / `unBindRequest`
+- `ProtocolUtils`、`AesDemoUtil`、`k/e/g/d2/b/h`、`SettingAssetPresenter`、
+  `com/autosdk/user/presenter/account/`（账号相关）
+- `CarModelPackageManager`（`"com.autonavi.amapauto.bydcar"` 是与外部数据比对的 JSON `format` 常量）
+- `AutoApplication`、`android/media/AudioTrack`（车机平台标识 / GAODE_VEHICLE 通道判断）
+
+**必须跟着改**：AIDL 生成的 Binder token
+（`com.autonavi.amapauto.aidl.IJsonProtocol*`）。这些 token 由 AIDL 编译器按
+`<包名>.<接口名>` 生成，必须和改名后的接口类保持一致，否则
+`$Stub` 与 `$Proxy` 对不上，调用会抛
+「Binder invocation to an incorrect interface」。两端都在本 APK 内，
+不涉及外部对端。因此脚本里把它们放进 `ALWAYS_RENAME`，即使在 KEEP 文件内也改。
+
+## 11.6 验证结果（手机，与旧包共存）
+
+安装前手机已装 `com.autonavi.amapauto`（原包），直接安装改包名后的 APK：
+
+```
+$ adb install -r .work/out/amap-splitfix-lite.apk
+Install command complete in 8155 ms          ← 不再报冲突
+
+$ adb shell pm list packages | grep amap
+package:com.autonavi.amapauto                ← 原装保留
+package:com.autonavi.amapautolite            ← 新包共存
+```
+
+两个包都能各自正常启动（`pidof` 都返回进程号）。
+
+改包名后三个修复依然生效（`.work/logs/renamed-launch.log`）：
+
+| 判据 | 结果 |
+|---|---|
+| 进程存活 | ✔ `pid=7245` |
+| `FATAL EXCEPTION` | 0 |
+| `mc_fix_display_relaunched`（fix#1） | 0 |
+| `WZW_DPI : applyImmersive`（fix#3） | 0 |
+| `WZWXTT`（注入语音仍在跑） | 11 行，未误伤 |
+| `type=statusBars visible=` | `true` |
+| `com.byd.naviauto.mapprovider` 旧串残留 | 0 |
+| manifest 结构 vs 原包（归一化后） | 完全一致（997 行 / 613 属性） |
+| 25 个 dex 头部校验 | 全部通过 |
+
+另外用虚拟显示（`overlay_display_devices`，displayId≠0，即比亚迪分屏的等价物）
+启动新包：`mc_fix_display_relaunched=0`、`FATAL EXCEPTION=0`、进程存活 ⇒ fix#1 在改包名后依然有效。
+
+## 11.7 已知取舍
+
+改成独立包名后，它就是**另一个 App**。车机上以 `com.autonavi.amapauto`
+为键的系统集成（语音唤醒、方向盘按键、仪表/HUD 投射、
+`json_protocol_service` / `carlie` AIDL）仍会绑定到**车机原装的那个**应用，
+不会自动接到我们这个共存包上。这是「与原装共存」的必然代价。

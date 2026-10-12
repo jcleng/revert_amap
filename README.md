@@ -6,14 +6,15 @@
 
 | 项目 | 内容 |
 |---|---|
-| 目标包 | `com.autonavi.amapauto` |
+| 原包名 | `com.autonavi.amapauto` |
+| **新包名** | `com.autonavi.amapautolite`（为与原装共存而改，见问题 4） |
 | 版本 | `V3.15.872.11.910.1.202608311746.2`（versionCode 872） |
 | 原包 SHA-256 | `450a1848ec6ecbda9a981598b9338f58784dcd6951a81d7ec8a8e198f10bf285` |
 | **根因 1** | 第三方重打包注入的 `MainActivity.mcFixDisplay()`（`classes9.dex`） |
 | **根因 2** | `NaviView.Dd()` 对 `j5`(= `lane_location`) 未判空 → NPE（`classes22.dex`） |
 | **根因 3** | 第三方注入的 `DpiScaleManager.applyImmersive()` 强制沉浸式全屏，隐藏状态栏+导航栏（`classes25.dex`） |
 | **修复** | #1 短路为 `return false`；#2 加判空；#3 跳过整段 window 操作。只改这三个 dex 并重签 |
-| 补丁包 SHA-256 | `93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed` |
+| 补丁包 SHA-256 | `93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed`（原名）<br>`087ab9463af593fb5ab394896d7add0a5e002da43f8680753cd36feb6a771c10`（改包名版 `amap-splitfix-lite.apk`） |
 
 三个 bug 的触发条件不同，**车机上分屏会同时踩到 #1 和 #2**，#3 则与分屏无关、每次启动都生效：
 
@@ -22,6 +23,7 @@
 | #1 `mcFixDisplay` | `getDisplay().getDisplayId() != 0` | 车机分屏 = 独立显示屏 |
 | #2 `NaviView.Dd` NPE | `isInMultiWindowMode() == true` | 同屏分屏（displayId 仍为 0） |
 | #3 `applyImmersive` | 无（每次 `onCreate` 都执行） | 界面默认全屏、状态栏/导航栏被隐藏 |
+| #4 包名冲突 | 车机已装原装高德 | 安装报「与现有软件冲突」，装不上 |
 
 ## 问题是什么
 
@@ -193,8 +195,16 @@ vs 修复组 `amap-splitfix.apk`（`93f8831b…`）：
 
 ## 使用方法
 
+装到**已预装高德**的车机上（要共存）用改包名版：
+
 ```bash
-# 补丁包与原包签名不同，必须先卸载
+adb install -r .work/out/amap-splitfix-lite.apk
+# 安装后：com.autonavi.amapauto（原装）与 com.autonavi.amapautolite（修复版）共存
+```
+
+装到**没有预装高德**的设备上，可以用不改包名的版本：
+
+```bash
 adb uninstall com.autonavi.amapauto
 adb install -r .work/out/amap-splitfix.apk
 ```
@@ -202,11 +212,14 @@ adb install -r .work/out/amap-splitfix.apk
 ## 自己构建
 
 ```bash
-bash scripts/build_patch.sh   # 生成打过补丁的 classes9/22/25.dex
-bash scripts/build_apk.sh     # 替换进原 APK + zipalign + apksigner
+bash scripts/build_patch.sh   # 生成打过补丁 + 改名的 *_pkg.dex
+bash scripts/build_apk.sh     # 改包名/authority + 替换 dex + zipalign + apksigner
 ```
 
-产物在 `.work/out/amap-splitfix.apk`。
+产物在 `.work/out/amap-splitfix-lite.apk`（改包名，`com.autonavi.amapautolite`）。
+
+改包名涉及的坑（新包名以旧包名为前缀、authority 的字段初始化器写法、
+AIDL token 必须跟着改）见 [`docs/findings.md`](docs/findings.md) 第 11 节。
 
 ## 仓库结构
 
@@ -217,7 +230,9 @@ scripts/build_patch.sh   dex 打补丁（三个修复）
 scripts/fix_mcFixDisplay.py   修复 #1 的 smali 改写
 scripts/fix_NaviView.py       修复 #2 的 smali 改写
 scripts/fix_DpiScaleManager.py 修复 #3（强制全屏）的 smali 改写
-scripts/build_apk.sh     打包 + 重签
+scripts/fix_RenamePackage.py   dex 侧改包名（类型描述符 + 选择性字符串 + 目录搬迁）
+scripts/rename_pkg_binary.py   二进制改 AndroidManifest.xml / resources.arsc 的包名
+scripts/build_apk.sh     改包名 + 打包 + 重签
 scripts/capture.sh       adb 无线配对 / 抓崩溃日志
 scripts/splitscreen.sh   分屏测试台（real 同屏分屏 / virt 虚拟屏）
 scripts/repro_navi_npe.sh 一键复现 #2（真机真实分屏）
@@ -230,7 +245,14 @@ AGENTS.md                Agent / 开发者操作指南
 - ⚠️ **签名会变**。重签后证书指纹从 `E4:4F:CB:38…` 变为 `89:B8:C3:05…`。
   已排查的签名校验点（Tinker 热修、`Sign.checkPackageSign`、硬编码 MD5、`sharedUserId`）均**不阻塞**，
   但**尚不确定**车机上是否有其它模块按原指纹校验此 App。
-- ⚠️ 车机若为系统预装应用，替换可能需要系统权限。
+- ⚠️ 车机若为系统预装应用，替换可能需要系统权限。**改包名版可绕过这一点**：
+  它与原装共存，不覆盖系统应用（实测 `adb install` 成功，两个包同时存在）。
+- ⚠️ **共存版与原装是两套数据**。账号登录状态、离线地图、设置各自独立，需要重新登录/下载。
+- ⚠️ 车机上以 `com.autonavi.amapauto` 为键的**系统集成**（语音唤醒、方向盘按键、
+  仪表/HUD 投射、`json_protocol_service` / `carlie` AIDL）仍绑定**原装**那个应用，
+  不会自动切到共存包。这是共存的必然代价。
+- ℹ️ 官方「高德公开车机版」的包名也是 `com.autonavi.amapauto`（实测官网 V1.9.0 与 V9.5.0
+  两个包均如此），所以"改成公开版包名"无法解决冲突，必须换成真正不同的包名。
 - ⚠️ 本仓库**不包含** APK / dex / 反编译源码等大文件（见 `.gitignore`）。请自备原包。
 - ℹ️ `NaviView.Dd()` 的 NPE（根因 2）在**非平台化设备**（`PlatformUtils.isPlatformUI()==false`，
   例如 `ro.vehicle.type` 为 `IVI` / DiLink UI 版本为 `0.0UI`）上必现；平台化车机走完整布局不会崩，

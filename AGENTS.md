@@ -6,7 +6,8 @@
 
 修复 **BYD DiLink 车机版「高德地图（车道级导航版）」** 在 **分屏（Split-Screen / Multi-Window）** 模式下的闪退。
 
-- 目标包名：`com.autonavi.amapauto`
+- 原包名：`com.autonavi.amapauto`
+- 构建产物包名：`com.autonavi.amapautolite`（为在预装车机上共存而改，见 §2.4）
 - 版本：`V3.15.872.11.910.1.202608311746.2`（versionCode 872，minSdk 24，targetSdk 30）
 - 原包 SHA-256：`450a1848ec6ecbda9a981598b9338f58784dcd6951a81d7ec8a8e198f10bf285`
 
@@ -48,8 +49,45 @@
 | #2 `NaviView.Dd` NPE | `isInMultiWindowMode() == true` | 同屏分屏（displayId 仍为 0） |
 | #3 `applyImmersive` | 无（每次 `onCreate` 都执行） | 界面默认全屏、状态栏/导航栏被隐藏 |
 
+| #4 包名冲突 | 车机已预装原装高德 | 安装报「与现有软件冲突」 |
+
 > 车机分屏**同时**满足 #1 与 #2，所以两个都必须修。手机上用 AOSP 同屏分屏可以单独复现 #2
 > （`displayId` 不变，因此 #1 不触发）。#3 与分屏无关，任何设备上都生效。
+
+### 2.4 第四个问题：装不上车机 → 改包名
+
+车机安装报「与现有软件冲突」。实测底层错误码是 **`INSTALL_FAILED_CONFLICTING_PROVIDER`**，
+冲突的不只是签名，还有 **ContentProvider authority**：
+
+```
+Can't install because provider name com.byd.naviauto.mapprovider
+(in package com.autonavi.amapautolite) is already used by com.autonavi.amapauto
+```
+
+**别走弯路**：官方「高德公开车机版」的包名**也是** `com.autonavi.amapauto`
+（实测官网 `guanwangV1.9.0.2080.apk` 与 `Auto_9.5.0.600013_release_signed.apk` 都是），
+所以「改成公开版包名」是个空操作，必须换一个真正不同的包名。
+本项目用 `com.autonavi.amapautolite`。
+
+要改的地方：
+
+| 位置 | 说明 |
+|---|---|
+| `AndroidManifest.xml` / `resources.arsc` | 二进制字符串池 + 包名 256 字节字段（`scripts/rename_pkg_binary.py`） |
+| dex 类型描述符 | `Lcom/autonavi/amapauto/` 无条件全改（`scripts/fix_RenamePackage.py`） |
+| dex 字符串字面量 | 选择性改，服务端上报值保持原样（§3 修复 #4） |
+| 两个非包名派生的 authority | `com.byd.naviauto.mapprovider`、`com.byd.automap.fenceprovider` |
+
+> ⚠️ **两个坑**：
+> 1. 新包名以旧包名为前缀，`str.replace` 会二次替换产出 `...amapautolitelite`，
+>    必须用负向断言 `com\.autonavi\.amapauto(?!lite)`。
+> 2. authority 还会以**字段初始化器**形式出现
+>    （`.field public static final AUTHORITY:Ljava/lang/String; = "..."`），
+>    正则只匹配 `const-string` 会漏掉 `FenceContentProvider.AUTHORITY`。
+>
+> AIDL 生成的 Binder token（`com.autonavi.amapauto.aidl.*`）**必须跟着改**，
+> 否则 `$Stub`/`$Proxy` 对不上会抛「Binder invocation to an incorrect interface」；
+> 已在 `fix_RenamePackage.py` 的 `ALWAYS_RENAME` 里处理。
 
 ## 3. 修复
 
@@ -96,10 +134,20 @@
 
 不改 `0x1706` 为 `0x0`，是因为 `0x0` 仍会覆盖宿主可能自己设置的 UI 标志；整段不碰最安全。
 
-只替换 `classes9.dex`、`classes22.dex`、`classes25.dex`，其余 14791 个 zip 条目逐字节不变，然后重新签名。
+### 修复 #4：改包名 + 改冲突 authority（为了和车机原装共存）
 
-- 补丁包：`.work/out/amap-splitfix.apk`（三个修复都在）
+见 §2.4。字符串口径为 **safe**：服务端上报值保持原样（`UserConstant.PACKAGE_NAME`、
+`BydAccountReceiver.PACKAGE_NAME`、`ProtocolUtils`、`AesDemoUtil`、
+`com/autosdk/user/presenter/account/`、`CarModelPackageManager` 等，完整清单在
+`scripts/fix_RenamePackage.py` 的 `KEEP` 表），本地自用值与 AIDL token 跟着改。
+
+只替换 `classes.dex / classes5 / classes8 / classes9 / classes11 / classes13 /
+classes18 / classes21 / classes22 / classes25` 共 10 个 dex，其余 zip 条目逐字节不变，然后重新签名。
+
+- 补丁包（原名版）：`.work/out/amap-splitfix.apk`（三个修复都在）
   SHA-256 `93f8831bf43be0566a945e253c0cfa50a456a8a6736551e1e833279bd4b4e6ed`
+- **共存版（改包名，推荐装车）**：`.work/out/amap-splitfix-lite.apk`
+  SHA-256 `087ab9463af593fb5ab394896d7add0a5e002da43f8680753cd36feb6a771c10`
 - 对照组（只修 #1+#2，用于证明 #3）：`.work/out/amap-nofix3.apk`
   SHA-256 `e32177eec5076656497a02e967f8ad0e2ef58ee03cf8ebe2cedc25da93e9ee1d`
 - 对照组（只修 #1，用于证明 #2）：`.work/out/amap-mcfix-only-signed.apk`
@@ -120,14 +168,16 @@
 │   ├── fix_mcFixDisplay.py       # 修复 #1 的 smali 改写
 │   ├── fix_NaviView.py           # 修复 #2 的 smali 改写
 │   ├── fix_DpiScaleManager.py    # 修复 #3（强制全屏）的 smali 改写
-│   ├── build_apk.sh              # 替换 dex + zipalign + apksigner → 可安装 APK
+│   ├── fix_RenamePackage.py      # 修复 #4：dex 侧改包名 + 冲突 authority（含 KEEP 表）
+│   ├── rename_pkg_binary.py      # 修复 #4：二进制改 manifest / arsc 包名
+│   ├── build_apk.sh              # 改包名 + 替换 dex + zipalign + apksigner → 可安装 APK
 │   ├── capture.sh                # adb 无线配对 / 连接 / 抓崩溃日志
 │   ├── splitscreen.sh            # 分屏测试台（real 同屏分屏 / virt 虚拟屏 / exit / log）
 │   ├── repro_navi_npe.sh         # 一键复现根因 #2（真机真实分屏 + 导航）
 │   ├── jxctl.sh / jxq.py         # JADX 常驻查询服务（快速 grep 反编译源码）
 │   └── dexstr.py                 # DEX 字符串提取
 ├── patches/
-│   ├── README.md                 # 三个补丁的 before/after smali
+│   ├── README.md                 # 补丁的 before/after smali
 │   ├── mcFixDisplay.patched.smali
 │   ├── NaviView.Dd.patched.smali
 │   └── DpiScaleManager.applyImmersive.patched.smali
@@ -135,7 +185,8 @@
 │   ├── JadxServer.java           # JADX 常驻 TCP 查询服务
 │   └── Export.java               # JADX 全量源码导出
 └── .work/                        # 工作区（不入 git）
-    ├── out/amap-splitfix.apk     # ★ 补丁产物（三个修复）
+    ├── out/amap-splitfix.apk     # 补丁产物（三个修复，原名）
+    ├── out/amap-splitfix-lite.apk  # ★ 共存版（改包名，推荐装车）
     ├── out/amap-nofix3.apk       # 对照组（只修 #1+#2）
     ├── out/amap-mcfix-only-signed.apk  # 对照组（只修 #1）
     ├── patch/classes9_patched.dex
@@ -175,17 +226,24 @@ java -jar /opt/rea-tools/apktool.jar b -o patched.apk smali_out # 回编译
 ## 6. 构建流程
 
 ```bash
-# 1) 生成打过补丁的 classes9/22/25.dex
+# 1) 生成打过补丁 + 改名的 *_pkg.dex（10 个 dex）
 bash scripts/build_patch.sh
 
-# 2) 替换进原 APK 并重签
+# 2) 改包名/authority + 替换 dex + zipalign + 重签
 bash scripts/build_apk.sh
 ```
 
+`build_patch.sh` 会：先对 `classes9/22/25` 跑三个代码修复得到 `*_patched.dex`，
+再对全部 10 个 dex 跑 `fix_RenamePackage.py` 得到 `*_pkg.dex`。
+
 `build_apk.sh` 会：
-1. 逐条复制原 zip，跳过 `META-INF/*.SF|*.RSA|*.DSA|*.EC|MANIFEST.MF`，把 `classes9.dex`/`classes22.dex`/`classes25.dex` 换成补丁版；
-2. `zipalign -f -p 4`；
-3. `apksigner sign`（v1+v2+v3，keystore `.work/keystore/amapfix2.jks`，口令 `amapfix2`）。
+1. 用 `rename_pkg_binary.py` 就地改 `AndroidManifest.xml` 与 `resources.arsc`
+   （包名 + 两个冲突 authority）；
+2. 逐条复制原 zip，跳过 `META-INF/*.SF|*.RSA|*.DSA|*.EC|MANIFEST.MF`，把 10 个 dex 换成 `*_pkg.dex`；
+3. `zipalign -f -p 4`；
+4. `apksigner sign`（v1+v2+v3，keystore `.work/keystore/amapfix2.jks`，口令 `amapfix2`）。
+
+产物：`.work/out/amap-splitfix-lite.apk`（包名 `com.autonavi.amapautolite`）。
 
 ## 7. 验证
 
@@ -205,8 +263,10 @@ ADB=/opt/rea-tools/platform-tools/adb
 $ADB shell "settings put global overlay_display_devices '1280x720/213'"
 
 # 把高德丢进虚拟屏
-$ADB shell "am force-stop com.autonavi.amapauto"
-$ADB shell "am start --display 2 -n com.autonavi.amapauto/com.byd.automap.activity.MainActivity"
+$ADB shell "am force-stop com.autonavi.amapautolite"
+# 注意：overlay display 的 displayId 不一定是 2，先查
+DID=$($ADB shell "dumpsys display" | grep -oE 'mDisplayId=[0-9]+' | sort -u | grep -v '=0' | tail -1 | cut -d= -f2)
+$ADB shell "am start --display $DID -n com.autonavi.amapautolite/com.byd.automap.activity.MainActivity"
 
 # 抓日志
 $ADB logcat -d -v threadtime > /tmp/x.log
@@ -254,6 +314,19 @@ bash scripts/repro_navi_npe.sh .work/out/amap-splitfix.apk
   - 无硬编码签名 MD5 比对；Manifest 无 `sharedUserId`。
   - **但仍未知**车机上是否有其它模块按原指纹校验此 App。
 - **安装需先卸载**：签名不同，`adb install -r` 会失败；车机若为系统预装应用可能需要系统权限。
+  **共存版（`amap-splitfix-lite.apk`）不需要卸载**：包名已改成 `com.autonavi.amapautolite`，
+  与原装并存，实测 `adb install` 直接成功。装共存版前**不要** `adb uninstall com.autonavi.amapauto`。
+- **改包名改出的两个坑**（改包名/加新 authority 时务必先读）：
+  1. 新包名以旧包名为前缀 ⇒ 必须用 `com\.autonavi\.amapauto(?!lite)` 负向断言，
+     否则二次替换产出 `...amapautolitelite`；
+  2. authority 还会写成**字段初始化器**（`.field … = "..."`），只匹配 `const-string` 会漏。
+  两个脚本（`fix_RenamePackage.py` / `rename_pkg_binary.py`）都已处理，改动时别退化。
+- **改包名后要跟着改 AIDL token**：`com.autonavi.amapauto.aidl.*` 由 AIDL 编译器生成，
+  必须与改名后的接口类一致，否则 Binder 调用抛
+  「Binder invocation to an incorrect interface」。已放进 `ALWAYS_RENAME`（即使在 KEEP 文件内也改）。
+- **改名口径 = safe**：服务端上报的身份字符串（账号绑定/云端接口参数）**保持原样**，
+  详见 `scripts/fix_RenamePackage.py` 的 `KEEP` 表。想改成 full 口径就删掉那些条目，
+  但会改变服务端看到的包名，可能影响账号/云端接口。
 - **不要提交大文件**：APK/dex/反编译源码/keystore 都已在 `.gitignore` 中。
 - **磁盘紧张**：`/` 曾到 97%。清理时注意 `.work/jadx-src`（196 MB）、`.work/installed`（535 MB）、`.work/logs`。
 - **adb 操作没有交互 stdin**：Shell 工具不能 `read -r`，一切必须用 adb 命令驱动（如 `input tap`、`uiautomator dump`）。

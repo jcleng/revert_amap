@@ -6,6 +6,12 @@
 *.so
 *.idsig
 
+# ---- apktool 解码中间产物（临时目录，勿提交）----
+/sm/
+/smali/
+/build/
+/dist/
+
 # ---- 工作区 ----
 .work/
 !scripts/

@@ -12,7 +12,7 @@
 # Usage: ./repro_navi_npe.sh <apk|->   # "-" = keep whatever is installed
 set -uo pipefail
 ADB=${ADB:-/opt/rea-tools/platform-tools/adb}
-PKG=com.autonavi.amapauto
+PKG=${PKG:-com.autonavi.amapautolite}
 ACT=$PKG/com.byd.automap.activity.MainActivity
 OUT=${OUT:-.work/logs}
 LOGF=$OUT/$(basename "${2:-$1}" .apk)-navinpe.log
