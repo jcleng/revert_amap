@@ -39,3 +39,4 @@ __pycache__/
 
 # ---- 第三方 skill（由 skills-lock.json 记录来源，可重现） ----
 .pi/skills/
+.work/release/

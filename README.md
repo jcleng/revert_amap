@@ -2,6 +2,8 @@
 
 逆向分析并修复 **BYD DiLink 车机版「高德地图（车道级导航版）」** 在 **分屏（Split-Screen）** 模式下的闪退问题。
 
+📦 **现成修复包下载：[Releases / 1.0.0](https://github.com/jcleng/revert_amap/releases/tag/1.0.0)**
+
 ## 结论速览
 
 | 项目 | 内容 |
@@ -293,10 +295,23 @@ if (d.getPowerType() == -1) return 0;    // 「读不到」  → 油车   ← BU
 
 ## 使用方法
 
+### 直接下载现成包
+
+到 [**Releases / 1.0.0**](https://github.com/jcleng/revert_amap/releases/tag/1.0.0) 下载：
+
+| 文件 | 内容 |
+|---|---|
+| `amap-splitfix-lite-v1.0.0.zip` | **修复包**（含修复 #1–#6），解压得 `amap-splitfix-lite.apk` |
+| `amap-original-v1.0.0.zip` | **原始未修改包**，仅供对照/复现 |
+
+修复包 SHA-256 `f1d17de2ca1576112151c59c9de3fdd9478306c6ab13c7b05cedc07d162a293f`（`amap-splitfix-lite.apk`）。
+
+### 安装
+
 装到**已预装高德**的车机上（要共存）用改包名版：
 
 ```bash
-adb install -r .work/out/amap-splitfix-lite.apk
+adb install -r amap-splitfix-lite.apk
 # 安装后：com.autonavi.amapauto（原装）与 com.autonavi.amapautolite（修复版）共存
 ```
 
